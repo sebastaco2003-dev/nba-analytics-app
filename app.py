@@ -128,6 +128,7 @@ st.markdown("""
 # Constantes de Calibración y Mercado
 UMBRAL_ALTA_CONFIANZA = 58.0
 BREAK_EVEN_ODDS_110 = 52.38  # Probabilidad implícita estándar de momio -110 (1.91)
+UMBRAL_EDGE_OPERABLE = 5.0   # Edge mínimo neto para considerar un mercado operable
 
 ESTATUS_NO_DISPONIBLE = [
     'out', 'injured', 'injury', 'doubtful', 'suspension', 'suspended',
@@ -531,11 +532,6 @@ def calcular_lineas_automaticas_jugador(df_jugador_previo):
 
 
 def calcular_consistencia_y_estabilidad(df_jugador_previo, col, linea, direccion="MÁS"):
-    """
-    Calcula dos métricas clave de filtrado de calidad:
-    1. Hit Rate L10: % de veces en últimos 10 juegos que cumplió la línea en la dirección sugerida.
-    2. Coeficiente de Variación (CV %): std / mean -> clasifica estabilidad (Estable / Moderado / Volátil).
-    """
     if df_jugador_previo is None or df_jugador_previo.empty:
         return 50.0, 28.0, "🟡 Moderado"
 
@@ -739,8 +735,43 @@ def calcular_ajustes_rotacion_capa5(
     return ajustes, jugadores_out
 
 # ==============================================================================
-# 3. CAPAS 1, 2 Y 3 CALIBRADAS: EDGE %, PRA Y REGRESIÓN BAYESIANA
+# 3. CAPAS 1, 2 Y 3 CALIBRADAS: CLASIFICACIÓN POR EDGE NETO Y PRA
 # ==============================================================================
+
+def clasificar_oportunidad_partido(abrev_ganador, edge_ml, dir_total, linea_ou, edge_ou, umbral_edge=UMBRAL_EDGE_OPERABLE):
+    """
+    Separa con precisión qué mercados de un partido tienen ventaja real (>= umbral_edge)
+    y marca explícitamente cuándo evitar un lado sin Edge (ej. ML con Edge negativo o O/U en zona de ruido).
+    """
+    ml_valido = edge_ml >= umbral_edge
+    ou_valido = edge_ou >= umbral_edge
+
+    if ml_valido and ou_valido:
+        nivel = "💎 DOBLE EDGE (ML + O/U)"
+        mercado_op = f"{abrev_ganador} ML + {dir_total} {linea_ou}"
+        score_orden = max(edge_ml, edge_ou) + 12.0  # Prioridad máxima por doble confirmación
+    elif ou_valido and not ml_valido:
+        nivel = "🎯 EDGE SOLO TOTAL (O/U)"
+        mercado_op = f"Solo {dir_total} {linea_ou} (Evitar ML)"
+        score_orden = edge_ou + 4.0
+    elif ml_valido and not ou_valido:
+        nivel = "🏆 EDGE SOLO GANADOR (ML)"
+        mercado_op = f"Solo {abrev_ganador} ML (Evitar O/U)"
+        score_orden = edge_ml + 4.0
+    else:
+        nivel = "⚖️ Sin Ventaja Clara"
+        mercado_op = "No operar (Edge insuficiente)"
+        score_orden = max(edge_ml, edge_ou)
+
+    return {
+        'nivel': nivel,
+        'mercado_operable': mercado_op,
+        'ml_valido': ml_valido,
+        'ou_valido': ou_valido,
+        'es_operable': (ml_valido or ou_valido),
+        'score_orden': round(score_orden, 2)
+    }
+
 
 def calcular_contexto_colectivo_capa1(
     id_t1,
@@ -785,7 +816,6 @@ def calcular_contexto_colectivo_capa1(
 
     diferencia_esperada = lambda_t1 - lambda_t2
     spread_modelo = abs(diferencia_esperada)
-    # Si hay spread oficial de las casas de apuestas, usamos el mayor para detectar riesgo de paliza
     spread_ref = max(spread_modelo, spread_mercado) if spread_mercado is not None else spread_modelo
 
     if spread_ref >= 12.0:
@@ -902,7 +932,6 @@ def calcular_proyeccion_jugador_capa2_3(
     lambda_ast = (0.80 * lambda_ast_tope) + (0.20 * linea_ast)
     lambda_pra = lambda_pts + lambda_reb + lambda_ast
 
-    # 1. Probabilidad PUNTOS
     std_hist_pts = df_valid['PTS'].std() if len(df_valid) > 1 else 6.0
     if pd.isna(std_hist_pts):
         std_hist_pts = 6.0
@@ -911,19 +940,16 @@ def calcular_proyeccion_jugador_capa2_3(
     prob_more_pts = min(max((1.0 - norm.cdf(z_score)) * 100.0, 25.0), 75.0)
     prob_less_pts = 100.0 - prob_more_pts
 
-    # 2. Probabilidad REBOTES
     std_reb = max(float(df_valid['REB'].std()) if len(df_valid) > 1 else 2.5, np.sqrt(max(lambda_reb, 1.0)) * 1.25, 2.0)
     z_reb = (linea_reb - lambda_reb) / std_reb
     prob_more_reb = min(max((1.0 - norm.cdf(z_reb)) * 100.0, 25.0), 75.0)
     prob_less_reb = 100.0 - prob_more_reb
 
-    # 3. Probabilidad ASISTENCIAS
     std_ast = max(float(df_valid['AST'].std()) if len(df_valid) > 1 else 2.2, np.sqrt(max(lambda_ast, 1.0)) * 1.25, 1.8)
     z_ast = (linea_ast - lambda_ast) / std_ast
     prob_more_ast = min(max((1.0 - norm.cdf(z_ast)) * 100.0, 25.0), 75.0)
     prob_less_ast = 100.0 - prob_more_ast
 
-    # 4. Probabilidad PRA (Puntos + Rebotes + Asistencias)
     pra_series = df_valid['PRA'] if 'PRA' in df_valid.columns else (df_valid['PTS'] + df_valid['REB'] + df_valid['AST'])
     std_hist_pra = float(pra_series.std()) if len(pra_series) > 1 else 7.5
     if pd.isna(std_hist_pra):
@@ -933,7 +959,6 @@ def calcular_proyeccion_jugador_capa2_3(
     prob_more_pra = min(max((1.0 - norm.cdf(z_pra)) * 100.0, 25.0), 75.0)
     prob_less_pra = 100.0 - prob_more_pra
 
-    # Evaluar los 4 mercados para encontrar el MEJOR MERCADO (Top Pick) por Edge y Estabilidad
     mercados_eval = []
     configs = [
         ('PTS', lambda_pts, linea_pts, prob_more_pts, prob_less_pts),
@@ -946,8 +971,9 @@ def calcular_proyeccion_jugador_capa2_3(
         prob_m = max(p_m, p_l)
         edge_m = round(prob_m - BREAK_EVEN_ODDS_110, 1)
         hr_m, cv_m, estab_m = calcular_consistencia_y_estabilidad(df_jugador, m_nom, m_lin, dir_m)
-        # Score compuesto: premia Edge %, Hit Rate y penaliza alta volatilidad (CV%)
-        score_calidad = edge_m + (hr_m - 50.0) * 0.12 - max(cv_m - 25.0, 0.0) * 0.15
+        # Curva de calidad: premia el "Sweet Spot" (+5% a +12% Edge), Hit Rate y Estabilidad
+        penalizacion_anomalia = max(edge_m - 13.5, 0.0) * 0.35
+        score_calidad = edge_m - penalizacion_anomalia + (hr_m - 50.0) * 0.14 - max(cv_m - 25.0, 0.0) * 0.15
         mercados_eval.append({
             'mercado': m_nom,
             'direccion': dir_m,
@@ -1243,9 +1269,12 @@ def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
     p1 = round(p1, 1)
 
     badge_ganador = ""
-    if max(p1, p2) >= 62.0:
+    edge_fav = round(max(p1, p2) - BREAK_EVEN_ODDS_110, 1)
+    if edge_fav >= UMBRAL_EDGE_OPERABLE:
         fav = abrev_t1 if p1 >= p2 else abrev_t2
-        badge_ganador = f' <span class="badge-high-conf">🔥 ALTA CONFIANZA ({fav} {max(p1, p2):.1f}%)</span>'
+        badge_ganador = f' <span class="badge-high-conf">🏆 VENTAJA ML ({fav} {max(p1, p2):.1f}% | Edge +{edge_fav}%)</span>'
+    else:
+        badge_ganador = f' <span class="badge-normal-conf">⚠️ ML Sin Edge ({edge_fav:+.1f}%)</span>'
 
     st.markdown(f"""
         <div style="margin-top: 6px;">
@@ -1263,7 +1292,7 @@ def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
 
 def obtener_html_badge_confianza(prob_rec):
     edge_val = round(prob_rec - BREAK_EVEN_ODDS_110, 1)
-    if prob_rec >= UMBRAL_ALTA_CONFIANZA:
+    if prob_rec >= UMBRAL_ALTA_CONFIANZA and edge_val >= UMBRAL_EDGE_OPERABLE:
         return f'<div class="badge-high-conf">🔥 ALTA CONFIANZA ({prob_rec:.1f}% | Edge +{edge_val}%)</div>'
     return f'<div class="badge-normal-conf">⚖️ Estándar ({prob_rec:.1f}% | Edge {edge_val:+.1f}%)</div>'
 
@@ -1272,7 +1301,7 @@ def obtener_html_badge_confianza(prob_rec):
 # ==============================================================================
 
 st.title("🏀 NBA Real-Time Analytics & Backtesting Engine")
-st.markdown("Motor Probabilístico Institucional: **Edge % vs Break-Even (-110)**, **Consistencia L10**, **Estabilidad (CV%)** y **Mejor Mercado (PTS / REB / AST / PRA)**.")
+st.markdown("Motor Probabilístico Institucional: **Clasificación Inteligente por Edge Neto**, **Consistencia L10**, **Estabilidad (CV%)** y **Mejor Mercado (PTS / REB / AST / PRA)**.")
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
@@ -1345,16 +1374,26 @@ altas_manuales_in = st.sidebar.multiselect(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Filtros de Calidad de Mercado")
+filtro_equipos_modo = st.sidebar.selectbox(
+    "Filtrar Tabla de Partidos (Equipos)",
+    [
+        "Todos los partidos (Ordenados por Calidad)",
+        "💎 Solo Doble Edge (ML + O/U)",
+        "🎯 Mercados con Edge en Total (O/U ≥ +5%)",
+        "🏆 Mercados con Edge en Ganador (ML ≥ +5%)",
+        "✅ Solo Partidos Operables (Al menos 1 Edge ≥ +5%)"
+    ],
+    index=0
+)
 modo_mercado_resumen = st.sidebar.radio(
     "Estrategia en Tabla de Jugadores",
     ["🏆 Mejor Mercado Auto (PTS/REB/AST/PRA)", "🏀 Solo Mercado de Puntos (PTS)"],
     index=0
 )
-min_edge_filtro = st.sidebar.slider("Edge Mínimo vs Break-Even (%)", min_value=0.0, max_value=15.0, value=4.5, step=0.5)
+min_edge_filtro = st.sidebar.slider("Edge Mínimo vs Break-Even (%)", min_value=0.0, max_value=15.0, value=5.0, step=0.5)
 min_hit_rate_filtro = st.sidebar.slider("Consistencia Mínima L10 (%)", min_value=0, max_value=90, value=60, step=10)
 excluir_volatiles = st.sidebar.checkbox("Excluir jugadores 🔴 Volátiles (CV > 33%)", value=True)
-aplicar_filtros_calidad = st.sidebar.checkbox("Activar Filtros de Calidad en Tabla Jugadores", value=False)
-solo_alta_confianza_eq = st.sidebar.checkbox("🔥 Solo Alta Confianza (≥62%) en Tabla Equipos", value=False)
+aplicar_filtros_calidad = st.sidebar.checkbox("Activar Filtros de Calidad en Tabla Jugadores", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 Fatiga y Automatización")
@@ -1710,7 +1749,26 @@ if cartelera_fecha:
             max_prob_val = max(prob_t1, prob_t2)
             edge_ml = round(max_prob_val - BREAK_EVEN_ODDS_110, 1)
             edge_ou = round(prob_total_rec - BREAK_EVEN_ODDS_110, 1)
-            es_alta_conf_eq = max_prob_val >= 62.0 or prob_total_rec >= 62.0
+
+            clasif_eq = clasificar_oportunidad_partido(
+                abrev_ganador=ganador_recomendado,
+                edge_ml=edge_ml,
+                dir_total=verdict_partido_total,
+                linea_ou=linea_ou_partido,
+                edge_ou=edge_ou,
+                umbral_edge=UMBRAL_EDGE_OPERABLE
+            )
+
+            ganador_display = (
+                f"{ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%)"
+                if clasif_eq['ml_valido']
+                else f"⚠️ {ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}% - Sin Edge)"
+            )
+            total_display = (
+                f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)"
+                if clasif_eq['ou_valido']
+                else f"⚠️ {verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}% - Ruido)"
+            )
 
             s1 = partido['score_t1']
             s2 = partido['score_t2']
@@ -1722,90 +1780,101 @@ if cartelera_fecha:
                 acerto_ganador = "🟢 Acierto" if ganador_recomendado == ganador_real else "🔴 Fallo"
                
                 resumen_equipos.append({
-                    'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_eq else 'Estándar',
+                    'Nivel': clasif_eq['nivel'],
+                    'Mercado Operable': clasif_eq['mercado_operable'],
                     'Hora (ECT)': partido['hora_ecuador'],
                     'Encuentro': partido['encuentro'],
                     'Marcador': f"🏁 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
-                    'Ganador Sugerido': ganador_recomendado,
-                    'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
-                    'Prob. Victoria': f"{max_prob_val:.1f}% (Edge {edge_ml:+.1f}%)",
-                    'Resultado Ganador': acerto_ganador,
+                    'Ganador Sugerido': ganador_display,
+                    'Resultado Ganador': acerto_ganador if clasif_eq['ml_valido'] else f"No operable ({acerto_ganador})",
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
-                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)",
+                    'Predicción Total': total_display,
                     'Total Real / Vivo': f"{total_actual} pts",
-                    'Resultado Total': cumplio_total,
-                    'Estado': 'Finalizado'
+                    'Resultado Total': cumplio_total if clasif_eq['ou_valido'] else f"No operable ({cumplio_total})",
+                    'Estado': 'Finalizado',
+                    '_ml_valido': clasif_eq['ml_valido'],
+                    '_ou_valido': clasif_eq['ou_valido'],
+                    '_es_operable': clasif_eq['es_operable'],
+                    '_score_orden': clasif_eq['score_orden']
                 })
 
                 st.info(f"📊 **Resultado Final Real:** {partido['abrev_t1']} **{s1} - {s2}** {partido['abrev_t2']} (Total: {total_actual} pts)")
                 col_res1, col_res2 = st.columns(2)
                 with col_res1:
-                    st.markdown(f"**Ganador Recomendado:** {ganador_recomendado} | **Real:** {ganador_real} → {acerto_ganador}")
+                    st.markdown(f"**Ganador:** {ganador_display} | **Real:** {ganador_real} → {acerto_ganador}")
                 with col_res2:
                     st.markdown(
-                        f"**Total Partido (Línea {linea_ou_partido} - {origen_ou_partido}):** Proyectado {total_proyectado_partido:.1f} "
-                        f"(**{verdict_partido_total} {linea_ou_partido}**) | Real: **{total_actual}** → {cumplio_total}"
+                        f"**Total Partido ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} "
+                        f"({total_display}) | Real: **{total_actual}** → {cumplio_total}"
                     )
             elif partido_en_vivo:
                 lider_actual = partido['abrev_t1'] if s1 > s2 else (partido['abrev_t2'] if s2 > s1 else "Empate")
                 estado_ganador_vivo = "🟢 Liderando" if lider_actual == ganador_recomendado else ("🟡 Empatado" if lider_actual == "Empate" else "🔴 Abajo")
 
                 resumen_equipos.append({
-                    'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_eq else 'Estándar',
+                    'Nivel': clasif_eq['nivel'],
+                    'Mercado Operable': clasif_eq['mercado_operable'],
                     'Hora (ECT)': partido['hora_ecuador'],
                     'Encuentro': partido['encuentro'],
                     'Marcador': f"🔴 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
-                    'Ganador Sugerido': ganador_recomendado,
-                    'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
-                    'Prob. Victoria': f"{max_prob_val:.1f}% (Edge {edge_ml:+.1f}%)",
+                    'Ganador Sugerido': ganador_display,
                     'Resultado Ganador': estado_ganador_vivo,
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
-                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)",
+                    'Predicción Total': total_display,
                     'Total Real / Vivo': f"🔴 {total_actual} pts",
                     'Resultado Total': f"⏳ {partido['estado']}",
-                    'Estado': f"🔴 {partido['estado']}"
+                    'Estado': f"🔴 {partido['estado']}",
+                    '_ml_valido': clasif_eq['ml_valido'],
+                    '_ou_valido': clasif_eq['ou_valido'],
+                    '_es_operable': clasif_eq['es_operable'],
+                    '_score_orden': clasif_eq['score_orden']
                 })
 
                 col_r1, col_r2 = st.columns(2)
                 with col_r1:
-                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= 62.0 else ""
-                    st.success(f"🏆 **Ganador Recomendado:** **{ganador_recomendado}** ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%){sello_ml} | Vivo: **{estado_ganador_vivo}**")
+                    if clasif_eq['ml_valido']:
+                        st.success(f"🏆 **Ganador Operable:** **{ganador_display}** | Vivo: **{estado_ganador_vivo}**")
+                    else:
+                        st.info(f"⚖️ **Ganador Sin Edge:** {ganador_display} | Vivo: **{estado_ganador_vivo}**")
                 with col_r2:
-                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= 62.0 else ""
-                    st.warning(
-                        f"📈 **Total Partido (Línea {linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → "
-                        f"**{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)**{sello_ou} | Acumulado: **{total_actual} pts**"
-                    )
+                    if clasif_eq['ou_valido']:
+                        st.warning(f"📈 **Total Operable ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}** | Acumulado: **{total_actual} pts**")
+                    else:
+                        st.info(f"⚖️ **Total Sin Edge ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display} | Acumulado: **{total_actual} pts**")
             else:
                 resumen_equipos.append({
-                    'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_eq else 'Estándar',
+                    'Nivel': clasif_eq['nivel'],
+                    'Mercado Operable': clasif_eq['mercado_operable'],
                     'Hora (ECT)': partido['hora_ecuador'],
                     'Encuentro': partido['encuentro'],
                     'Marcador': '-',
-                    'Ganador Sugerido': ganador_recomendado,
-                    'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
-                    'Prob. Victoria': f"{max_prob_val:.1f}% (Edge {edge_ml:+.1f}%)",
-                    'Resultado Ganador': 'Pendiente',
+                    'Ganador Sugerido': ganador_display,
+                    'Resultado Ganador': 'Pendiente' if clasif_eq['ml_valido'] else 'No operar',
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
-                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)",
+                    'Predicción Total': total_display,
                     'Total Real / Vivo': '-',
-                    'Resultado Total': 'Pendiente',
-                    'Estado': partido['estado']
+                    'Resultado Total': 'Pendiente' if clasif_eq['ou_valido'] else 'No operar',
+                    'Estado': partido['estado'],
+                    '_ml_valido': clasif_eq['ml_valido'],
+                    '_ou_valido': clasif_eq['ou_valido'],
+                    '_es_operable': clasif_eq['es_operable'],
+                    '_score_orden': clasif_eq['score_orden']
                 })
 
                 col_r1, col_r2 = st.columns(2)
                 with col_r1:
-                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= 62.0 else ""
-                    st.success(f"🏆 **Ganador Recomendado (Moneyline):** **{ganador_recomendado}** ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%){sello_ml}")
+                    if clasif_eq['ml_valido']:
+                        st.success(f"🏆 **Ganador Operable (Moneyline):** **{ganador_display}**")
+                    else:
+                        st.info(f"⚖️ **Ganador Descartado:** {ganador_display}")
                 with col_r2:
-                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= 62.0 else ""
-                    st.warning(
-                        f"📈 **Total Partido (Línea {linea_ou_partido} - {origen_ou_partido}):** "
-                        f"Proyección {total_proyectado_partido:.1f} pts → **RECOMENDACIÓN: {verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)**{sello_ou}"
-                    )
+                    if clasif_eq['ou_valido']:
+                        st.warning(f"📈 **Total Operable ({linea_ou_partido} - {origen_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}**")
+                    else:
+                        st.info(f"⚖️ **Total Descartado ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display}")
 
             renderizar_barra_probabilidad_dual(partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2)
             st.markdown("---")
@@ -1817,14 +1886,26 @@ else:
 # ==============================================================================
 
 if resumen_equipos:
-    st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos y Marcadores en Vivo")
-    st.markdown("Incluye **Edge % frente al Break-Even (-110 = 52.38%)** y marcadores sincronizados en tiempo real.")
+    st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Clasificados por Edge Real)")
+    st.markdown(
+        f"Separa automáticamente **💎 Doble Edge**, **🎯 Edge Solo Total (O/U)** y **🏆 Edge Solo Ganador (ML)** "
+        f"(umbral mínimo **Edge ≥ +{UMBRAL_EDGE_OPERABLE:.1f}%**)."
+    )
    
     df_equipos = pd.DataFrame(resumen_equipos)
-    if solo_alta_confianza_eq:
-        df_equipos = df_equipos[df_equipos['Prob_Max_Num'] >= 62.0]
+    df_equipos = df_equipos.sort_values(by='_score_orden', ascending=False)
 
-    df_equipos_export = df_equipos.drop(columns=['Prob_Max_Num'], errors='ignore').copy()
+    if "Doble Edge" in filtro_equipos_modo:
+        df_equipos = df_equipos[df_equipos['_ml_valido'] & df_equipos['_ou_valido']]
+    elif "Solo Total" in filtro_equipos_modo:
+        df_equipos = df_equipos[df_equipos['_ou_valido']]
+    elif "Solo Ganador" in filtro_equipos_modo:
+        df_equipos = df_equipos[df_equipos['_ml_valido']]
+    elif "Solo Partidos Operables" in filtro_equipos_modo:
+        df_equipos = df_equipos[df_equipos['_es_operable']]
+
+    cols_ocultas_eq = ['_ml_valido', '_ou_valido', '_es_operable', '_score_orden']
+    df_equipos_export = df_equipos.drop(columns=cols_ocultas_eq, errors='ignore').copy()
     if not df_equipos_export.empty:
         csv_equipos = df_equipos_export.to_csv(index=False).encode('utf-8')
         st.download_button(
@@ -1835,7 +1916,7 @@ if resumen_equipos:
         )
         st.dataframe(df_equipos_export, use_container_width=True, hide_index=True)
     else:
-        st.info("Ningún encuentro supera el umbral de Alta Confianza en esta jornada.")
+        st.info("Ningún encuentro cumple el filtro seleccionado en el sidebar.")
     st.markdown("---")
 
 if resumen_jugadores:
