@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson, norm
 
@@ -34,6 +35,13 @@ st.markdown("""
         border: 1px solid #f59e0b !important;
         padding: 15px;
         border-radius: 10px;
+    }
+    .card-live {
+        background-color: rgba(59, 130, 246, 0.12) !important;
+        border: 1px solid #3b82f6 !important;
+        padding: 14px;
+        border-radius: 10px;
+        margin-bottom: 10px;
     }
     .card-high-conf {
         box-shadow: 0 0 14px rgba(250, 204, 21, 0.35) !important;
@@ -119,11 +127,20 @@ st.markdown("""
 
 UMBRAL_ALTA_CONFIANZA = 62.0
 
+
+def normalizar_texto(texto):
+    """Elimina acentos y pasa a minúsculas para comparar nombres de jugadores sin fallos."""
+    if not texto:
+        return ""
+    nfkd = unicodedata.normalize('NFKD', str(texto))
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).strip().lower()
+
+
 # ==============================================================================
 # 1. EXTRACCIÓN DE DATOS BASE (CARTELERA, BACK-TO-BACK, ROSTERS Y RATINGS)
 # ==============================================================================
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=120)
 def obtener_cartelera_por_fecha(fecha_str):
     url_scoreboard = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={fecha_str}"
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -154,6 +171,9 @@ def obtener_cartelera_por_fecha(fecha_str):
                         linea_mercado_ou = float(ou_val)
                     except (ValueError, TypeError):
                         linea_mercado_ou = None
+
+            status_type = evento.get('status', {}).get('type', {})
+            estado_desc = status_type.get('shortDetail') or status_type.get('description', 'Programado')
            
             if len(competidores) == 2:
                 t1 = competidores[0]
@@ -163,7 +183,7 @@ def obtener_cartelera_por_fecha(fecha_str):
                 score_2 = t2.get('score', '0')
                
                 partidos.append({
-                    'event_id': evento.get('id'),
+                    'event_id': str(evento.get('id')),
                     'dt_orden': dt_orden,
                     'hora_ecuador': hora_ecuador_str,
                     'id_t1': str(t1.get('team', {}).get('id')),
@@ -178,8 +198,8 @@ def obtener_cartelera_por_fecha(fecha_str):
                    
                     'encuentro': f"{t1.get('team', {}).get('abbreviation')} vs {t2.get('team', {}).get('abbreviation')}",
                     'detalle': f"{t1.get('team', {}).get('displayName')} vs {t2.get('team', {}).get('displayName')}",
-                    'estado': evento.get('status', {}).get('type', {}).get('description', 'Programado'),
-                    'estado_codigo': evento.get('status', {}).get('type', {}).get('state', 'pre'),
+                    'estado': estado_desc,
+                    'estado_codigo': status_type.get('state', 'pre'),
                     'linea_mercado_ou': linea_mercado_ou
                 })
        
@@ -729,7 +749,7 @@ def calcular_proyeccion_jugador_capa2_3(
     }
 
 # ==============================================================================
-# 4. CAPA 4: EXTRACCIÓN Y MOTOR PROBABILÍSTICO EN VIVO (POLLING 30s)
+# 4. CAPA 4: EXTRACCIÓN Y MOTOR PROBABILÍSTICO EN VIVO (CORREGIDO ID + NOMBRE)
 # ==============================================================================
 
 def parsear_reloj_a_minutos(reloj_str):
@@ -744,6 +764,20 @@ def parsear_reloj_a_minutos(reloj_str):
         return 0.0
 
 
+def parsear_minutos_jugados_boxscore(val_min):
+    """Soporta tanto '24' como '24:35' en el boxscore en vivo."""
+    if not val_min:
+        return 0.0
+    s = str(val_min).strip()
+    try:
+        if ":" in s:
+            m, sec = s.split(":")
+            return float(m) + (float(sec) / 60.0)
+        return float(s)
+    except Exception:
+        return 0.0
+
+
 def obtener_datos_en_vivo_espn(event_id):
     if not event_id:
         return None
@@ -754,8 +788,10 @@ def obtener_datos_en_vivo_espn(event_id):
         res = requests.get(url, headers=headers, timeout=8).json()
         header_comp = res.get("header", {}).get("competitions", [{}])[0]
         status_obj = header_comp.get("status", {})
+        status_type = status_obj.get("type", {})
         
-        estado_tipo = status_obj.get("type", {}).get("state", "pre")
+        estado_tipo = status_type.get("state", "pre")
+        detalle_estado = status_type.get("shortDetail") or status_type.get("description", "")
         cuarto = int(status_obj.get("period", 1))
         reloj_str = status_obj.get("displayClock", "12:00")
         min_reloj = parsear_reloj_a_minutos(reloj_str)
@@ -764,7 +800,7 @@ def obtener_datos_en_vivo_espn(event_id):
         marcadores = {}
         for comp in competidores:
             abrev = comp.get("team", {}).get("abbreviation", "")
-            marcadores[abrev] = int(comp.get("score", 0))
+            marcadores[abrev] = int(comp.get("score", 0)) if str(comp.get("score", "0")).isdigit() else 0
             
         if estado_tipo == "pre":
             min_restantes_partido = 48.0
@@ -776,48 +812,68 @@ def obtener_datos_en_vivo_espn(event_id):
             else:
                 min_restantes_partido = min_reloj
 
-        stats_jugadores_vivo = {}
+        stats_por_id = {}
+        stats_por_nombre_norm = {}
         boxscore = res.get("boxscore", {}).get("players", [])
+        
         for equipo_box in boxscore:
             abrev_eq = equipo_box.get("team", {}).get("abbreviation", "")
-            estadisticas = equipo_box.get("statistics", [])
-            if not estadisticas:
-                continue
+            estadisticas_lista = equipo_box.get("statistics", [])
             
-            nombres_cols = estadisticas[0].get("names", [])
-            atletas = estadisticas[0].get("athletes", [])
-            
-            for atl in atletas:
-                info_atl = atl.get("athlete", {})
-                nombre = info_atl.get("displayName", "")
-                id_atl = info_atl.get("id", "")
-                valores = atl.get("stats", [])
+            for bloque_stats in estadisticas_lista:
+                nombres_cols = bloque_stats.get("names", [])
+                atletas = bloque_stats.get("athletes", [])
                 
-                if nombre and valores and len(valores) == len(nombres_cols):
-                    mapa_s = dict(zip(nombres_cols, valores))
-                    try:
-                        min_jugados = float(mapa_s.get("MIN", 0))
-                    except ValueError:
-                        min_jugados = 0.0
-                        
-                    stats_jugadores_vivo[nombre] = {
-                        "id": id_atl,
-                        "equipo": abrev_eq,
-                        "MIN_ACTUAL": min_jugados,
-                        "PTS_ACTUAL": int(mapa_s.get("PTS", 0)) if str(mapa_s.get("PTS", "0")).isdigit() else 0,
-                        "REB_ACTUAL": int(mapa_s.get("REB", 0)) if str(mapa_s.get("REB", "0")).isdigit() else 0,
-                        "AST_ACTUAL": int(mapa_s.get("AST", 0)) if str(mapa_s.get("AST", "0")).isdigit() else 0,
-                        "FALTAS": int(mapa_s.get("PF", 0)) if str(mapa_s.get("PF", "0")).isdigit() else 0,
-                    }
+                for atl in atletas:
+                    info_atl = atl.get("athlete", {})
+                    nombre = info_atl.get("displayName", "")
+                    id_atl = str(info_atl.get("id", ""))
+                    valores = atl.get("stats", [])
+                    did_not_play = atl.get("didNotPlay", False)
+                    
+                    if valores and len(valores) == len(nombres_cols):
+                        mapa_s = dict(zip(nombres_cols, valores))
+                        min_jugados = parsear_minutos_jugados_boxscore(mapa_s.get("MIN", 0))
+                        registro_vivo = {
+                            "id": id_atl,
+                            "nombre": nombre,
+                            "equipo": abrev_eq,
+                            "dnp": did_not_play,
+                            "MIN_ACTUAL": round(min_jugados, 1),
+                            "PTS_ACTUAL": int(mapa_s.get("PTS", 0)) if str(mapa_s.get("PTS", "0")).isdigit() else 0,
+                            "REB_ACTUAL": int(mapa_s.get("REB", 0)) if str(mapa_s.get("REB", "0")).isdigit() else 0,
+                            "AST_ACTUAL": int(mapa_s.get("AST", 0)) if str(mapa_s.get("AST", "0")).isdigit() else 0,
+                            "FALTAS": int(mapa_s.get("PF", 0)) if str(mapa_s.get("PF", "0")).isdigit() else 0,
+                        }
+                    else:
+                        # Jugador en banca que aún no entra a la cancha (0 min)
+                        registro_vivo = {
+                            "id": id_atl,
+                            "nombre": nombre,
+                            "equipo": abrev_eq,
+                            "dnp": did_not_play,
+                            "MIN_ACTUAL": 0.0,
+                            "PTS_ACTUAL": 0,
+                            "REB_ACTUAL": 0,
+                            "AST_ACTUAL": 0,
+                            "FALTAS": 0,
+                        }
+
+                    if id_atl:
+                        stats_por_id[id_atl] = registro_vivo
+                    if nombre:
+                        stats_por_nombre_norm[normalizar_texto(nombre)] = registro_vivo
                     
         return {
             "estado": estado_tipo,
+            "detalle_estado": detalle_estado,
             "cuarto": cuarto,
             "reloj": reloj_str,
             "min_reloj": min_reloj,
             "min_restantes_partido": min_restantes_partido,
             "marcadores": marcadores,
-            "jugadores": stats_jugadores_vivo
+            "jugadores_por_id": stats_por_id,
+            "jugadores_por_nombre": stats_por_nombre_norm
         }
     except Exception as e:
         print(f"Error live summary: {e}")
@@ -826,6 +882,7 @@ def obtener_datos_en_vivo_espn(event_id):
 
 def calcular_ajuste_vivo_capa4(
     datos_vivo,
+    id_jugador_espn,
     nombre_jugador,
     df_historial,
     minutos_proyectados_totales=34.0,
@@ -838,10 +895,16 @@ def calcular_ajuste_vivo_capa4(
     penalizacion_faltas=0.20,
     penalizacion_blowout=0.85
 ):
-    if not datos_vivo or nombre_jugador not in datos_vivo["jugadores"]:
+    if not datos_vivo:
+        return None
+
+    # Búsqueda robusta: primero por ID exacto de ESPN, luego por nombre normalizado sin acentos
+    j_vivo = datos_vivo["jugadores_por_id"].get(str(id_jugador_espn))
+    if not j_vivo:
+        j_vivo = datos_vivo["jugadores_por_nombre"].get(normalizar_texto(nombre_jugador))
+    if not j_vivo:
         return None
         
-    j_vivo = datos_vivo["jugadores"][nombre_jugador]
     cuarto = datos_vivo["cuarto"]
     min_reloj = datos_vivo["min_reloj"]
     min_restantes_partido = datos_vivo["min_restantes_partido"]
@@ -935,10 +998,6 @@ def calcular_ajuste_vivo_capa4(
 # ==============================================================================
 
 def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
-    """
-    Renderiza una barra horizontal dividida en dos colores (Azul Equipo 1 vs Naranja Equipo 2)
-    con etiquetas internas proporcionales a su probabilidad de victoria.
-    """
     p1 = min(max(float(prob_t1), 5.0), 95.0)
     p2 = round(100.0 - p1, 1)
     p1 = round(p1, 1)
@@ -976,11 +1035,17 @@ st.markdown("Motor Probabilístico Autónomo (Capas 1 a 5): Líneas Automáticas
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
-if st.sidebar.button("📅 Ir al Día de Hoy"):
-    st.session_state['fecha_input'] = datetime.today().date()
-    st.rerun()
+col_sb1, col_sb2 = st.sidebar.columns(2)
+with col_sb1:
+    if st.button("📅 Hoy"):
+        st.session_state['fecha_input'] = datetime.now(timezone(timedelta(hours=-5))).date()
+        st.rerun()
+with col_sb2:
+    if st.button("🔄 Refrescar"):
+        st.cache_data.clear()
+        st.rerun()
 
-fecha_defecto = st.session_state.get('fecha_input', datetime.today().date())
+fecha_defecto = st.session_state.get('fecha_input', datetime.now(timezone(timedelta(hours=-5))).date())
 fecha_seleccionada = st.sidebar.date_input("Seleccionar Fecha de Cartelera", value=fecha_defecto, key='fecha_input')
 fecha_str_api = fecha_seleccionada.strftime("%Y%m%d")
 fecha_busqueda_str = fecha_seleccionada.strftime("%Y-%m-%d")
@@ -1155,7 +1220,15 @@ if cartelera_fecha:
                 badges_ctx.append(f"🚨 Riesgo Paliza {ctx_partido['riesgo_paliza']} (Spread ~{ctx_partido['spread_proyectado']} pts)")
             str_badges = f" | {' · '.join(badges_ctx)}" if badges_ctx else ""
 
-            st.markdown(f"### ⏰ [{partido['hora_ecuador']} ECT] 🏟️ {partido['encuentro']} — *{partido['detalle']}* | Estado: `{partido['estado']}`")
+            partido_en_vivo = partido['estado_codigo'] == 'in'
+            partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
+
+            if partido_en_vivo:
+                marcador_str = f" 🔴 EN VIVO ({partido['estado']}): **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
+            else:
+                marcador_str = f" | Estado: `{partido['estado']}`"
+
+            st.markdown(f"### ⏰ [{partido['hora_ecuador']} ECT] 🏟️ {partido['encuentro']} — *{partido['detalle']}*{marcador_str}")
             st.caption(
                 f"⚡ **Ritmo Esperado:** {ctx_partido['posesiones_esperadas']} pos | "
                 f"**{partido['abrev_t1']}:** Λ = {ctx_partido['lambda_t1']} pts | "
@@ -1172,7 +1245,6 @@ if cartelera_fecha:
             jugadores_t2 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t2_id]
            
             col_p1, col_p2 = st.columns(2)
-            partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
            
             # Procesar Estrella Activa 1
             estrella_1 = hallar_estrella_activa_real(jugadores_t1, ajustes_t1)
@@ -1244,7 +1316,7 @@ if cartelera_fecha:
                             f"Proyección vs Líneas Auto ({lineas_auto_1['pts']}P / {lineas_auto_1['reb']}R / {lineas_auto_1['ast']}A)",
                             f"{lambda_p1:.1f} PTS | {proy_1['lambda_reb']:.1f} REB | {proy_1['lambda_ast']:.1f} AST"
                         )
-                        if st.button(f"Analizar a {nom_1}", key=f"btn_{id_1}_{partido['event_id']}"):
+                        if st.button(f"Analizar a {nom_1} en Vivo / Detalle", key=f"btn_{id_1}_{partido['event_id']}"):
                             st.session_state['jugador_seleccionado'] = nom_1
                             st.rerun()
                 else:
@@ -1320,7 +1392,7 @@ if cartelera_fecha:
                             f"Proyección vs Líneas Auto ({lineas_auto_2['pts']}P / {lineas_auto_2['reb']}R / {lineas_auto_2['ast']}A)",
                             f"{lambda_p2:.1f} PTS | {proy_2['lambda_reb']:.1f} REB | {proy_2['lambda_ast']:.1f} AST"
                         )
-                        if st.button(f"Analizar a {nom_2}", key=f"btn_{id_2}_{partido['event_id']}"):
+                        if st.button(f"Analizar a {nom_2} en Vivo / Detalle", key=f"btn_{id_2}_{partido['event_id']}"):
                             st.session_state['jugador_seleccionado'] = nom_2
                             st.rerun()
                 else:
@@ -1401,7 +1473,6 @@ if cartelera_fecha:
                         f"Proyección {total_proyectado_partido:.1f} pts → **RECOMENDACIÓN: {verdict_partido_total} ({prob_total_rec:.1f}%)**{sello_ou}"
                     )
 
-            # Barra Bicolor de Probabilidad de Victoria (Equipo 1 Azul vs Equipo 2 Naranja)
             renderizar_barra_probabilidad_dual(partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2)
             st.markdown("---")
 else:
@@ -1457,7 +1528,7 @@ if resumen_jugadores:
     st.markdown("---")
 
 # ==============================================================================
-# 9. ANÁLISIS DETALLADO DEL JUGADOR (CAPAS 2, 3, 4 Y 5 + INSIGNIAS ALTA CONFIANZA)
+# 9. ANÁLISIS DETALLADO DEL JUGADOR (CAPAS 2, 3, 4 EN VIVO CORREGIDA Y 5)
 # ==============================================================================
 
 if 'jugador_seleccionado' in st.session_state and st.session_state['jugador_seleccionado'] in nombres_disponibles:
@@ -1469,7 +1540,7 @@ else:
 
 if jugador_activo:
     info_sel = catalogo_jugadores[jugador_activo]
-    id_seleccionado = info_sel['id']
+    id_seleccionado = str(info_sel['id'])
     equipo_jugador = info_sel['team_name']
     team_id_jugador = str(info_sel['team_id'])
 
@@ -1562,14 +1633,20 @@ if jugador_activo:
             en_b2b=en_b2b_jugador
         )
 
-        # --- PANEL DINÁMICO EN VIVO (CAPA 4 - POLLING CADA 30s) ---
+        # --- PANEL DINÁMICO EN VIVO (CAPA 4 - POLLING CADA 30s SIN BLOQUEO DE CACHÉ) ---
         if evento_jugador and modo_vivo and proy_detallada and not ajuste_indiv_capa5.get('esta_out', False):
             @st.fragment(run_every=30)
             def panel_en_vivo_capa4():
                 datos_vivo = obtener_datos_en_vivo_espn(evento_jugador["event_id"])
-                if datos_vivo and datos_vivo["estado"] == "in":
+                if not datos_vivo:
+                    return
+
+                marc_str = " vs ".join([f"{eq} {pts}" for eq, pts in datos_vivo["marcadores"].items()])
+
+                if datos_vivo["estado"] == "in":
                     res_vivo = calcular_ajuste_vivo_capa4(
                         datos_vivo=datos_vivo,
+                        id_jugador_espn=id_seleccionado,
                         nombre_jugador=jugador_activo,
                         df_historial=df_jugador_previo,
                         minutos_proyectados_totales=minutos_proyectados_final,
@@ -1580,26 +1657,52 @@ if jugador_activo:
                         factor_rival=proy_detallada['factor_rival'],
                         factor_usage_bump=factor_bump_final
                     )
+                    st.markdown("---")
+                    st.markdown(f"""
+                        <div class="card-live">
+                            <h3 style="margin:0; color:#93c5fd;">🔴 SEGUIMIENTO EN VIVO — Q{datos_vivo['cuarto']} ({datos_vivo['reloj']}) | Marcador: {marc_str}</h3>
+                            <p style="margin:4px 0 0 0; font-size:13px; color:#cbd5e1;">Sincronización automática cada 30 segundos directamente desde Boxscore oficial.</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+
                     if res_vivo:
-                        st.markdown("---")
-                        st.subheader(f"🔴 EN VIVO (Q{datos_vivo['cuarto']} - {datos_vivo['reloj']}) | Polling 30s")
-                        
                         for alerta in res_vivo["alertas"]:
                             st.warning(alerta)
                             
                         act = res_vivo["actual"]
                         st.caption(
-                            f"Acumulado actual: **{act['PTS_ACTUAL']} PTS, {act['REB_ACTUAL']} REB, {act['AST_ACTUAL']} AST** "
-                            f"en {act['MIN_ACTUAL']:.0f} min ({act['FALTAS']} faltas) | "
-                            f"Minutos restantes proyectados: **{res_vivo['min_restantes_ajustados']} min**"
+                            f"📊 **Progreso Actual en Cancha:** **{act['PTS_ACTUAL']} PTS, {act['REB_ACTUAL']} REB, {act['AST_ACTUAL']} AST** "
+                            f"en {act['MIN_ACTUAL']:.1f} min ({act['FALTAS']} faltas) | "
+                            f"Minutos restantes estimados: **{res_vivo['min_restantes_ajustados']} min**"
                         )
                         
                         c1, c2, c3 = st.columns(3)
-                        c1.metric("Proyección Final PTS", f"{res_vivo['proj_pts']} pts", f"Over {linea_pts_eval}: {res_vivo['prob_over_pts']}%")
-                        c2.metric("Proyección Final REB", f"{res_vivo['proj_reb']} reb", f"Over {linea_reb_eval}: {res_vivo['prob_over_reb']}%")
-                        c3.metric("Proyección Final AST", f"{res_vivo['proj_ast']} ast", f"Over {linea_ast_eval}: {res_vivo['prob_over_ast']}%")
-                elif datos_vivo and datos_vivo["estado"] == "pre":
-                    st.info(f"⏳ Partido aún no inicia ({evento_jugador['hora_ecuador']} ECT vs {rival_abrev_ctx}). El motor en vivo (Capa 4) se activará automáticamente al iniciar el Q1.")
+                        with c1:
+                            st.metric(
+                                f"PTS: {act['PTS_ACTUAL']} / {linea_pts_eval}",
+                                f"Proy. Final: {res_vivo['proj_pts']} pts",
+                                f"Over {linea_pts_eval}: {res_vivo['prob_over_pts']}%"
+                            )
+                            st.progress(min(max(int((act['PTS_ACTUAL'] / max(linea_pts_eval, 0.5)) * 100), 0), 100))
+                        with c2:
+                            st.metric(
+                                f"REB: {act['REB_ACTUAL']} / {linea_reb_eval}",
+                                f"Proy. Final: {res_vivo['proj_reb']} reb",
+                                f"Over {linea_reb_eval}: {res_vivo['prob_over_reb']}%"
+                            )
+                            st.progress(min(max(int((act['REB_ACTUAL'] / max(linea_reb_eval, 0.5)) * 100), 0), 100))
+                        with c3:
+                            st.metric(
+                                f"AST: {act['AST_ACTUAL']} / {linea_ast_eval}",
+                                f"Proy. Final: {res_vivo['proj_ast']} ast",
+                                f"Over {linea_ast_eval}: {res_vivo['prob_over_ast']}%"
+                            )
+                            st.progress(min(max(int((act['AST_ACTUAL'] / max(linea_ast_eval, 0.5)) * 100), 0), 100))
+                    else:
+                        st.info(f"⏳ El partido está en vivo ({marc_str}), pero {jugador_activo} aún no registra aparición en el boxscore.")
+
+                elif datos_vivo["estado"] == "pre":
+                    st.info(f"⏳ Partido aún no inicia ({evento_jugador['hora_ecuador']} ECT vs {rival_abrev_ctx}). El progreso en vivo se activará automáticamente en el Q1.")
 
             panel_en_vivo_capa4()
 
