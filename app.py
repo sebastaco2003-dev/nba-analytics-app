@@ -129,8 +129,8 @@ st.markdown("""
 
 # Constantes de Calibración y Mercado
 UMBRAL_ALTA_CONFIANZA = 58.0
-BREAK_EVEN_ODDS_110 = 52.38  # Probabilidad implícita estándar de momio -110 (1.91)
-UMBRAL_EDGE_OPERABLE = 5.0   # Edge mínimo neto para considerar un mercado operable
+BREAK_EVEN_ODDS_110 = 52.38
+UMBRAL_EDGE_OPERABLE = 5.0
 
 ESTATUS_NO_DISPONIBLE = [
     'out', 'injured', 'injury', 'doubtful', 'suspension', 'suspended',
@@ -1397,7 +1397,7 @@ def obtener_html_badge_confianza(prob_rec):
 # ==============================================================================
 
 st.title("🏀 NBA Real-Time Analytics & Backtesting Engine")
-st.markdown("Motor Probabilístico Institucional + **Buscador Web en Vivo de Noticias y Reporte Médico NBA**.")
+st.markdown("Motor Probabilístico Institucional + **Buscador Web en Vivo de Noticias y Sincronización Directa de Bajas**.")
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
@@ -1442,7 +1442,7 @@ if jugador_seleccionado != "-- Selecciona un jugador --":
     else:
         st.sidebar.markdown(f'<div class="status-active">✅ <b>Estatus:</b> {status_actual} (Disponible)</div>', unsafe_allow_html=True)
 
-# --- CAPA 5: CONTROLES MANUALES OUT / IN EN EL SIDEBAR ---
+# --- CAPA 5: CONTROLES MANUALES OUT / IN EN EL SIDEBAR (CONECTADOS POR SESSION_STATE) ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🏥 Alineaciones y Bajas (Capa 5)")
 
@@ -1456,17 +1456,38 @@ jugadores_jornada = sorted([
     if str(inf.get('team_id')) in equipos_en_cartelera
 ]) if equipos_en_cartelera else nombres_disponibles
 
+# Inicializar listas de sesión si no existen y limpiar nombres que no pertenezcan a la jornada
+if 'bajas_manuales_out_state' not in st.session_state:
+    st.session_state['bajas_manuales_out_state'] = []
+else:
+    st.session_state['bajas_manuales_out_state'] = [
+        j for j in st.session_state['bajas_manuales_out_state'] if j in jugadores_jornada
+    ]
+
+if 'altas_manuales_in_state' not in st.session_state:
+    st.session_state['altas_manuales_in_state'] = []
+else:
+    st.session_state['altas_manuales_in_state'] = [
+        j for j in st.session_state['altas_manuales_in_state'] if j in jugadores_jornada
+    ]
+
 incluir_bajas_espn = st.sidebar.checkbox("Aplicar bajas automáticas del reporte médico", value=True)
 bajas_manuales_out = st.sidebar.multiselect(
     "Marcar Jugadores como OUT (Baja de última hora)",
     options=jugadores_jornada,
-    default=[]
+    key='bajas_manuales_out_state'
 )
 altas_manuales_in = st.sidebar.multiselect(
     "Forzar Jugadores como IN (Activos hoy)",
     options=jugadores_jornada,
-    default=[]
+    key='altas_manuales_in_state'
 )
+
+if st.session_state['bajas_manuales_out_state'] or st.session_state['altas_manuales_in_state']:
+    if st.sidebar.button("🧹 Limpiar listas OUT / IN"):
+        st.session_state['bajas_manuales_out_state'] = []
+        st.session_state['altas_manuales_in_state'] = []
+        st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Filtros de Calidad de Mercado")
@@ -2283,13 +2304,12 @@ with tab_modelo:
                         st.progress(min(max(int(p_more_bar), 0), 100))
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 2: BUSCADOR WEB DE NOTICIAS Y ESTADO DE JUGADORES
+# PESTAÑA 2: BUSCADOR WEB DE NOTICIAS Y ESTADO DE JUGADORES (CON 1-CLICK SIDEBAR)
 # ------------------------------------------------------------------------------
 with tab_buscador:
     st.subheader("🔍 Buscador en Tiempo Real: Estado de Jugadores y Noticias NBA")
     st.markdown(
-        "Consulta titulares en tiempo real desde **Google News** (en inglés para reportes inmediatos de *beat writers* / Rotowire o en español) "
-        "y revisa el **Monitor Oficial de Lesiones** de la NBA sin salir de la aplicación."
+        "Consulta titulares en tiempo real desde **Google News** y aplica con **1 clic** cualquier baja o confirmación directamente en el menú izquierdo (**Alineaciones y Bajas - Capa 5**)."
     )
 
     col_b1, col_b2, col_b3 = st.columns([3, 1.2, 1])
@@ -2330,6 +2350,25 @@ with tab_buscador:
         noticias_web = buscar_noticias_web_nba(query_usuario, idioma=cod_lang, max_resultados=10)
 
         if noticias_web:
+            # Detectar automáticamente jugadores de la jornada mencionados en los titulares
+            jugadores_mencionados = []
+            texto_titulares = " ".join([normalizar_texto(n['titulo']) for n in noticias_web])
+            for nom_j in jugadores_jornada:
+                if normalizar_texto(nom_j) in texto_titulares and nom_j not in jugadores_mencionados:
+                    jugadores_mencionados.append(nom_j)
+
+            if jugadores_mencionados:
+                st.markdown("🎯 **Jugadores de hoy detectados en estas noticias (Aplicar 1 clic al sidebar):**")
+                cols_det = st.columns(min(len(jugadores_mencionados), 3))
+                for idx_m, nom_det in enumerate(jugadores_mencionados[:6]):
+                    with cols_det[idx_m % 3]:
+                        if st.button(f"🚫 {nom_det} → OUT", key=f"web_out_{nom_det}", use_container_width=True):
+                            if nom_det not in st.session_state['bajas_manuales_out_state']:
+                                st.session_state['bajas_manuales_out_state'].append(nom_det)
+                            if nom_det in st.session_state['altas_manuales_in_state']:
+                                st.session_state['altas_manuales_in_state'].remove(nom_det)
+                            st.rerun()
+
             for n in noticias_web:
                 st.markdown(f"""
                     <div class="card-live" style="padding: 10px 14px; margin-bottom: 8px;">
@@ -2354,12 +2393,104 @@ with tab_buscador:
                 st.markdown(f"[Leer nota completa ↗]({ne['url']})")
 
     st.markdown("---")
-    st.subheader("🏥 Monitor Oficial de Lesiones de la Liga (Filtrable)")
+    st.subheader("🏥 Monitor Oficial de Lesiones de la Liga (Sincronización 1-Clic con Sidebar)")
     df_lesiones_full = obtener_tabla_completa_lesiones_nba()
+
     if not df_lesiones_full.empty:
-        filtro_lesion_txt = st.text_input("Filtrar tabla oficial por equipo, jugador o estatus (ej. Out, Day-To-Day, Lakers, Heat):", "")
+        # Mapear nombres normalizados de la jornada para cruce exacto con el sidebar
+        mapa_norm_jornada = {normalizar_texto(j): j for j in jugadores_jornada}
+
+        df_lesiones_full['Juega Hoy'] = df_lesiones_full['Jugador'].apply(
+            lambda x: "✅ Sí (En Cartelera)" if normalizar_texto(x) in mapa_norm_jornada else "— No juega hoy"
+        )
+
+        # Detectar todos los jugadores que juegan hoy y tienen estatus OUT / Doubtful
+        bajas_hoy_detectadas = []
+        jugadores_hoy_en_reporte = []
+        for _, row_l in df_lesiones_full.iterrows():
+            nom_norm = normalizar_texto(row_l['Jugador'])
+            if nom_norm in mapa_norm_jornada:
+                nom_exacto_sb = mapa_norm_jornada[nom_norm]
+                jugadores_hoy_en_reporte.append({
+                    'nombre': nom_exacto_sb,
+                    'equipo': row_l['Equipo'],
+                    'estatus': row_l['Estatus'],
+                    'motivo': row_l['Lesión / Motivo']
+                })
+                if es_estatus_baja(row_l['Estatus']) and nom_exacto_sb not in bajas_hoy_detectadas:
+                    bajas_hoy_detectadas.append(nom_exacto_sb)
+
+        # Botón maestro de 1 clic para enviar todas las bajas de hoy al sidebar izquierdo
+        col_sync1, col_sync2 = st.columns([1.3, 1.7])
+        with col_sync1:
+            if st.button(
+                f"⚡ Aplicar TODOS los OUT de Hoy al Sidebar ({len(bajas_hoy_detectadas)} jugadores)",
+                use_container_width=True,
+                type="primary"
+            ):
+                actuales_out = list(st.session_state['bajas_manuales_out_state'])
+                for b_nom in bajas_hoy_detectadas:
+                    if b_nom not in actuales_out:
+                        actuales_out.append(b_nom)
+                    if b_nom in st.session_state['altas_manuales_in_state']:
+                        st.session_state['altas_manuales_in_state'].remove(b_nom)
+                st.session_state['bajas_manuales_out_state'] = actuales_out
+                st.rerun()
+        with col_sync2:
+            solo_hoy_chk = st.checkbox("Mostrar en la tabla solo jugadores de equipos que juegan hoy", value=True)
+
+        filtro_lesion_txt = st.text_input(
+            "Filtrar tabla por equipo, jugador o estatus (ej. Out, Day-To-Day, Lakers, Heat):",
+            ""
+        )
+
         df_mostrar_les = df_lesiones_full.copy()
+        if solo_hoy_chk:
+            df_mostrar_les = df_mostrar_les[df_mostrar_les['Juega Hoy'].str.contains("Sí")]
+
         if filtro_lesion_txt.strip():
-            mask = df_mostrar_les.apply(lambda row: row.astype(str).str.contains(filtro_lesion_txt, case=False, na=False).any(), axis=1)
+            mask = df_mostrar_les.apply(
+                lambda row: row.astype(str).str.contains(filtro_lesion_txt, case=False, na=False).any(),
+                axis=1
+            )
             df_mostrar_les = df_mostrar_les[mask]
-        st.dataframe(df_mostrar_les, use_container_width=True, hide_index=True)
+
+        cols_orden_les = ['Juega Hoy', 'Equipo', 'Jugador', 'Posición', 'Estatus', 'Lesión / Motivo', 'Comentario Oficial']
+        st.dataframe(df_mostrar_les[cols_orden_les], use_container_width=True, hide_index=True)
+
+        # Panel de botones individuales de 1 clic para aplicar OUT o IN en el sidebar izquierdo
+        if not df_mostrar_les.empty:
+            st.markdown("#### 🎛️ Acción Rápida Individual (1 clic para enviar a la barra izquierda)")
+            st.caption("Haz clic en **🚫 OUT** para marcarlo como baja en el sidebar o en **✅ IN** si se confirma que sí juega hoy:")
+
+            filas_accion = []
+            for _, r_act in df_mostrar_les.iterrows():
+                n_norm = normalizar_texto(r_act['Jugador'])
+                if n_norm in mapa_norm_jornada:
+                    filas_accion.append((mapa_norm_jornada[n_norm], r_act['Equipo'], r_act['Estatus']))
+
+            if filas_accion:
+                for idx_f, (nom_sb, eq_sb, est_sb) in enumerate(filas_accion[:24]):
+                    c_a1, c_a2, c_a3 = st.columns([3, 1, 1])
+                    esta_en_out = nom_sb in st.session_state['bajas_manuales_out_state']
+                    esta_en_in = nom_sb in st.session_state['altas_manuales_in_state']
+                    marca_estado = " *(Ya en OUT)*" if esta_en_out else (" *(Ya en IN)*" if esta_en_in else "")
+
+                    with c_a1:
+                        st.markdown(f"**{nom_sb}** ({eq_sb}) — `{est_sb}`{marca_estado}")
+                    with c_a2:
+                        if st.button("🚫 Aplicar OUT", key=f"btn_out_{idx_f}_{nom_sb}", use_container_width=True):
+                            if nom_sb not in st.session_state['bajas_manuales_out_state']:
+                                st.session_state['bajas_manuales_out_state'].append(nom_sb)
+                            if nom_sb in st.session_state['altas_manuales_in_state']:
+                                st.session_state['altas_manuales_in_state'].remove(nom_sb)
+                            st.rerun()
+                    with c_a3:
+                        if st.button("✅ Forzar IN", key=f"btn_in_{idx_f}_{nom_sb}", use_container_width=True):
+                            if nom_sb not in st.session_state['altas_manuales_in_state']:
+                                st.session_state['altas_manuales_in_state'].append(nom_sb)
+                            if nom_sb in st.session_state['bajas_manuales_out_state']:
+                                st.session_state['bajas_manuales_out_state'].remove(nom_sb)
+                            st.rerun()
+            else:
+                st.info("Los jugadores filtrados actualmente no tienen partido programado en la cartelera de hoy.")
