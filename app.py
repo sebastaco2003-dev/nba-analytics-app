@@ -9,7 +9,7 @@ from scipy.stats import poisson, norm
 # Configuración inicial de la página web
 st.set_page_config(page_title="NBA Analytics & Backtesting Engine", page_icon="🏀", layout="wide")
 
-# Estilos CSS avanzados para diseño profesional, insignias de Alta Confianza y barra bicolor
+# Estilos CSS avanzados
 st.markdown("""
     <style>
     .stMetric {
@@ -125,8 +125,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Umbral calibrado para probabilidades realistas (58.5% en props equivale a ventaja estadística real)
-UMBRAL_ALTA_CONFIANZA = 58.5
+# Constantes de Calibración y Mercado
+UMBRAL_ALTA_CONFIANZA = 58.0
+BREAK_EVEN_ODDS_110 = 52.38  # Probabilidad implícita estándar de momio -110 (1.91)
 
 ESTATUS_NO_DISPONIBLE = [
     'out', 'injured', 'injury', 'doubtful', 'suspension', 'suspended',
@@ -176,6 +177,7 @@ def obtener_cartelera_por_fecha(fecha_str):
 
             odds_list = competitions.get('odds', [])
             linea_mercado_ou = None
+            spread_mercado = None
             if odds_list and isinstance(odds_list, list):
                 ou_val = odds_list[0].get('overUnder')
                 if ou_val is not None:
@@ -183,6 +185,12 @@ def obtener_cartelera_por_fecha(fecha_str):
                         linea_mercado_ou = float(ou_val)
                     except (ValueError, TypeError):
                         linea_mercado_ou = None
+                sp_val = odds_list[0].get('spread')
+                if sp_val is not None:
+                    try:
+                        spread_mercado = abs(float(sp_val))
+                    except (ValueError, TypeError):
+                        spread_mercado = None
 
             bajas_evento_ids = set()
             bajas_evento_nombres = set()
@@ -229,6 +237,7 @@ def obtener_cartelera_por_fecha(fecha_str):
                     'estado_codigo': status_type.get('state', 'pre'),
                     'cuarto': int(status_obj.get('period', 0)),
                     'linea_mercado_ou': linea_mercado_ou,
+                    'spread_mercado': spread_mercado,
                     'bajas_evento_ids': list(bajas_evento_ids),
                     'bajas_evento_nombres': list(bajas_evento_nombres)
                 })
@@ -416,13 +425,18 @@ def consultar_gamelog_jugador(id_espn):
                     except Exception:
                         min_val = 0.0
 
+                    pts_v = int(stats.get('points', 0))
+                    reb_v = int(stats.get('totalRebounds', 0))
+                    ast_v = int(stats.get('assists', 0))
+
                     filas.append({
                         'FECHA': fecha_raw,
                         'RIVAL': info_partido.get('opponent', {}).get('abbreviation', ''),
                         'MIN': min_val,
-                        'PTS': int(stats.get('points', 0)),
-                        'REB': int(stats.get('totalRebounds', 0)),
-                        'AST': int(stats.get('assists', 0))
+                        'PTS': pts_v,
+                        'REB': reb_v,
+                        'AST': ast_v,
+                        'PRA': pts_v + reb_v + ast_v
                     })
 
         df = pd.DataFrame(filas)
@@ -442,17 +456,12 @@ def obtener_historial_previo_sin_leakage(df_jugador, fecha_limite_str):
 
 
 def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
-    """
-    Ponderación exponencial reciente para evitar proyecciones infladas en jugadores
-    que regresan de lesión o vienen con restricción de minutos:
-    55% últimos 5 juegos + 30% juegos 6-10 + 15% resto de temporada.
-    """
     if df_jugador_previo is None or df_jugador_previo.empty:
-        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
+        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'pra': 23.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
 
     df_v = df_jugador_previo[df_jugador_previo['MIN'] > 0]
     if df_v.empty:
-        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
+        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'pra': 23.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
 
     df_5 = df_v.head(5)
     df_10 = df_v.head(10)
@@ -467,8 +476,8 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
     pts_p = pond_col('PTS')
     reb_p = pond_col('REB')
     ast_p = pond_col('AST')
+    pra_p = pond_col('PRA') if 'PRA' in df_v.columns else (pts_p + reb_p + ast_p)
 
-    # Tasas por minuto ponderadas
     tasa_pts_5 = df_5['PTS'].sum() / max(df_5['MIN'].sum(), 1.0)
     tasa_pts_10 = df_10['PTS'].sum() / max(df_10['MIN'].sum(), 1.0)
     tasa_pts = (0.55 * tasa_pts_5) + (0.45 * tasa_pts_10)
@@ -486,6 +495,7 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
         'pts': round(pts_p, 1),
         'reb': round(reb_p, 1),
         'ast': round(ast_p, 1),
+        'pra': round(pra_p, 1),
         'tasa_pts': tasa_pts,
         'tasa_reb': tasa_reb,
         'tasa_ast': tasa_ast
@@ -493,24 +503,21 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
 
 
 def calcular_lineas_automaticas_jugador(df_jugador_previo):
-    """
-    Estima la línea de mercado usando la mediana y media ponderada (evita que un solo partido
-    de 45 puntos infle artificialmente la línea base).
-    """
     if df_jugador_previo is None or df_jugador_previo.empty:
-        return {'pts': 15.5, 'reb': 5.5, 'ast': 3.5}
+        return {'pts': 15.5, 'reb': 5.5, 'ast': 3.5, 'pra': 24.5}
 
     df_v = df_jugador_previo[df_jugador_previo['MIN'] > 0]
     if df_v.empty:
-        return {'pts': 15.5, 'reb': 5.5, 'ast': 3.5}
+        return {'pts': 15.5, 'reb': 5.5, 'ast': 3.5, 'pra': 24.5}
 
     st_pond = calcular_estadisticas_ponderadas_jugador(df_jugador_previo)
     df_10 = df_v.head(10)
 
-    # Mezcla 65% media ponderada + 35% mediana reciente (las casas de apuestas usan mediana/moda)
     pts_ref = (0.65 * st_pond['pts']) + (0.35 * df_10['PTS'].median())
     reb_ref = (0.65 * st_pond['reb']) + (0.35 * df_10['REB'].median())
     ast_ref = (0.65 * st_pond['ast']) + (0.35 * df_10['AST'].median())
+    pra_series = df_10['PRA'] if 'PRA' in df_10.columns else (df_10['PTS'] + df_10['REB'] + df_10['AST'])
+    pra_ref = (0.65 * st_pond['pra']) + (0.35 * pra_series.median())
 
     def a_medio_punto(val):
         return max(np.floor(val) + 0.5, 0.5)
@@ -518,11 +525,53 @@ def calcular_lineas_automaticas_jugador(df_jugador_previo):
     return {
         'pts': round(a_medio_punto(pts_ref), 1),
         'reb': round(a_medio_punto(reb_ref), 1),
-        'ast': round(a_medio_punto(ast_ref), 1)
+        'ast': round(a_medio_punto(ast_ref), 1),
+        'pra': round(a_medio_punto(pra_ref), 1)
     }
 
+
+def calcular_consistencia_y_estabilidad(df_jugador_previo, col, linea, direccion="MÁS"):
+    """
+    Calcula dos métricas clave de filtrado de calidad:
+    1. Hit Rate L10: % de veces en últimos 10 juegos que cumplió la línea en la dirección sugerida.
+    2. Coeficiente de Variación (CV %): std / mean -> clasifica estabilidad (Estable / Moderado / Volátil).
+    """
+    if df_jugador_previo is None or df_jugador_previo.empty:
+        return 50.0, 28.0, "🟡 Moderado"
+
+    df_v = df_jugador_previo[df_jugador_previo['MIN'] > 0].head(10)
+    if df_v.empty:
+        return 50.0, 28.0, "🟡 Moderado"
+
+    if col == 'PRA' and 'PRA' not in df_v.columns:
+        serie = df_v['PTS'] + df_v['REB'] + df_v['AST']
+    else:
+        serie = df_v[col]
+
+    if direccion == "MÁS":
+        aciertos = (serie > linea).sum()
+    else:
+        aciertos = (serie < linea).sum()
+
+    hit_rate = (aciertos / len(serie)) * 100.0
+    media = max(float(serie.mean()), 0.5)
+    std = float(serie.std()) if len(serie) > 1 else media * 0.25
+    if pd.isna(std):
+        std = media * 0.25
+
+    cv_pct = (std / media) * 100.0
+
+    if cv_pct < 24.0:
+        etiqueta_estab = "🟢 Estable"
+    elif cv_pct <= 33.0:
+        etiqueta_estab = "🟡 Moderado"
+    else:
+        etiqueta_estab = "🔴 Volátil"
+
+    return round(hit_rate, 0), round(cv_pct, 1), etiqueta_estab
+
 # ==============================================================================
-# 2. CAPA 5 CALIBRADA: SIN DOBLE CONTEO DE LESIONES Y CON ENCOGIMIENTO BAYESIANO
+# 2. CAPA 5 CALIBRADA: ALINEACIONES, REDISTRIBUCIÓN DE MINUTOS Y USAGE BUMP
 # ==============================================================================
 
 def normalizar_grupo_posicion(pos_str):
@@ -545,14 +594,6 @@ def calcular_ajustes_rotacion_capa5(
     bajas_evento_nombres=None,
     datos_vivo_partido=None
 ):
-    """
-    Calibración anti-inflación:
-    1. Solo redistribuye minutos de bajas RECIENTES (que jugaron en los últimos 18 días).
-       Si un jugador lleva meses lesionado, su ausencia ya está descontada en los stats actuales.
-    2. Aplica encogimiento del 35% (shrinkage): gran parte de los minutos vacantes los absorben
-       suplentes de rotación profunda, no las estrellas que ya juegan 33+ min.
-    3. Tope estricto de +3.0 minutos extra y multiplicador combinado máximo de 1.10x (+10%).
-    """
     bajas_ev_ids_set = set(str(x) for x in (bajas_evento_ids or []))
     bajas_ev_noms_set = set(bajas_evento_nombres or [])
 
@@ -646,14 +687,12 @@ def calcular_ajustes_rotacion_capa5(
             'motivos': ['Jugador descartado / OUT']
         }
 
-    # Filtrar SOLO bajas recientes para redistribuir (evita doble conteo de lesiones viejas)
     bajas_redistribuibles = [b for b in jugadores_out if b['es_baja_reciente']]
 
     if not bajas_redistribuibles or not jugadores_activos:
         return ajustes, jugadores_out
 
     for baja in bajas_redistribuibles:
-        # Encogimiento del 35%: solo el 35% de los minutos vacantes suben a titulares principales
         min_vacantes_efectivos = baja['min_base'] * 0.35
         grupo_baja = baja['grupo_pos']
         usg_baja = baja['usg_est']
@@ -694,14 +733,13 @@ def calcular_ajustes_rotacion_capa5(
             continue
         ratio_min = dat['min_ajustados'] / max(dat['min_base'], 1.0)
         mult_bruto = ratio_min * dat['factor_usage_bump']
-        # Cap conservador estricto: máximo +10% combinado para evitar proyecciones infladas
         mult_tope = min(mult_bruto, 1.10)
         dat['multiplicador_combinado'] = round(mult_tope, 3)
 
     return ajustes, jugadores_out
 
 # ==============================================================================
-# 3. CAPAS 1, 2 Y 3 CALIBRADAS: VARIANZA REALISTA NBA Y REGRESIÓN A LA MEDIA
+# 3. CAPAS 1, 2 Y 3 CALIBRADAS: EDGE %, PRA Y REGRESIÓN BAYESIANA
 # ==============================================================================
 
 def calcular_contexto_colectivo_capa1(
@@ -710,6 +748,7 @@ def calcular_contexto_colectivo_capa1(
     metricas_equipos,
     promedios_liga,
     linea_mercado_ou=None,
+    spread_mercado=None,
     t1_en_b2b=False,
     t2_en_b2b=False
 ):
@@ -745,12 +784,14 @@ def calcular_contexto_colectivo_capa1(
     std_total_partido = 16.0
 
     diferencia_esperada = lambda_t1 - lambda_t2
-    spread_abs = abs(diferencia_esperada)
+    spread_modelo = abs(diferencia_esperada)
+    # Si hay spread oficial de las casas de apuestas, usamos el mayor para detectar riesgo de paliza
+    spread_ref = max(spread_modelo, spread_mercado) if spread_mercado is not None else spread_modelo
 
-    if spread_abs >= 12.0:
+    if spread_ref >= 12.0:
         riesgo_paliza = "ALTO"
         factor_recorte_paliza = 0.91
-    elif spread_abs >= 8.5:
+    elif spread_ref >= 8.5:
         riesgo_paliza = "MODERADO"
         factor_recorte_paliza = 0.95
     else:
@@ -774,7 +815,7 @@ def calcular_contexto_colectivo_capa1(
         'prob_t1': round(prob_t1, 1),
         'prob_t2': round(prob_t2, 1),
         'prob_over_total': round(prob_over_total, 1),
-        'spread_proyectado': round(spread_abs, 1),
+        'spread_proyectado': round(spread_ref, 1),
         'riesgo_paliza': riesgo_paliza,
         'factor_recorte_paliza': factor_recorte_paliza,
         't1_en_b2b': t1_en_b2b,
@@ -810,6 +851,7 @@ def calcular_proyeccion_jugador_capa2_3(
     linea_pts,
     linea_reb,
     linea_ast,
+    linea_pra=None,
     posesiones_partido=None,
     def_rtg_rival=None,
     promedios_liga=None,
@@ -822,6 +864,9 @@ def calcular_proyeccion_jugador_capa2_3(
     if df_valid.empty:
         return None
 
+    if linea_pra is None:
+        linea_pra = round(linea_pts + linea_reb + linea_ast - 0.5, 1)
+
     st_pond = calcular_estadisticas_ponderadas_jugador(df_jugador)
     tasa_pts_min = st_pond['tasa_pts']
     tasa_reb_min = st_pond['tasa_reb']
@@ -831,7 +876,6 @@ def calcular_proyeccion_jugador_capa2_3(
     pace_liga = promedios_liga.get('pace_liga', 99.5) if promedios_liga else 99.5
     def_liga = promedios_liga.get('def_liga', 114.5) if promedios_liga else 114.5
 
-    # Amortiguación de factores externos (50% de sensibilidad para evitar extremos)
     factor_ritmo_raw = (posesiones_partido / pace_liga) if posesiones_partido else 1.0
     factor_ritmo = 1.0 + ((factor_ritmo_raw - 1.0) * 0.65)
 
@@ -849,37 +893,75 @@ def calcular_proyeccion_jugador_capa2_3(
     lambda_reb_bruto = tasa_reb_min * minutos_proyectados * factor_ritmo * (1.0 + (factor_usage_bump - 1.0) * 0.3)
     lambda_ast_bruto = tasa_ast_min * minutos_proyectados * factor_ritmo * (1.0 + (factor_rival - 1.0) * 0.5) * factor_usage_bump * factor_fatiga_eficiencia
 
-    # Tope máximo del 10% sobre proyección base sin bajas
     lambda_pts_tope = min(lambda_pts_bruto, lambda_pts_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_pts_bruto
     lambda_reb_tope = min(lambda_reb_bruto, lambda_reb_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_reb_bruto
     lambda_ast_tope = min(lambda_ast_bruto, lambda_ast_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_ast_bruto
 
-    # Regresión a la media (80% modelo + 20% línea evaluada) para calibrar probabilidad real
     lambda_pts = (0.80 * lambda_pts_tope) + (0.20 * linea_pts)
     lambda_reb = (0.80 * lambda_reb_tope) + (0.20 * linea_reb)
     lambda_ast = (0.80 * lambda_ast_tope) + (0.20 * linea_ast)
+    lambda_pra = lambda_pts + lambda_reb + lambda_ast
 
-    # Desviación estándar realista NBA (piso mínimo para no inflar Z-score)
+    # 1. Probabilidad PUNTOS
     std_hist_pts = df_valid['PTS'].std() if len(df_valid) > 1 else 6.0
     if pd.isna(std_hist_pts):
         std_hist_pts = 6.0
     std_pts = max(float(std_hist_pts), lambda_pts * 0.26, 5.2)
-
     z_score = (linea_pts - lambda_pts) / std_pts
-    prob_more_pts = (1.0 - norm.cdf(z_score)) * 100.0
-    prob_more_pts = min(max(prob_more_pts, 25.0), 75.0)
+    prob_more_pts = min(max((1.0 - norm.cdf(z_score)) * 100.0, 25.0), 75.0)
     prob_less_pts = 100.0 - prob_more_pts
 
-    # Para Rebotes y Asistencias usamos distribución Normal con sobredispersión (más realista que Poisson puro)
+    # 2. Probabilidad REBOTES
     std_reb = max(float(df_valid['REB'].std()) if len(df_valid) > 1 else 2.5, np.sqrt(max(lambda_reb, 1.0)) * 1.25, 2.0)
     z_reb = (linea_reb - lambda_reb) / std_reb
     prob_more_reb = min(max((1.0 - norm.cdf(z_reb)) * 100.0, 25.0), 75.0)
     prob_less_reb = 100.0 - prob_more_reb
 
+    # 3. Probabilidad ASISTENCIAS
     std_ast = max(float(df_valid['AST'].std()) if len(df_valid) > 1 else 2.2, np.sqrt(max(lambda_ast, 1.0)) * 1.25, 1.8)
     z_ast = (linea_ast - lambda_ast) / std_ast
     prob_more_ast = min(max((1.0 - norm.cdf(z_ast)) * 100.0, 25.0), 75.0)
     prob_less_ast = 100.0 - prob_more_ast
+
+    # 4. Probabilidad PRA (Puntos + Rebotes + Asistencias)
+    pra_series = df_valid['PRA'] if 'PRA' in df_valid.columns else (df_valid['PTS'] + df_valid['REB'] + df_valid['AST'])
+    std_hist_pra = float(pra_series.std()) if len(pra_series) > 1 else 7.5
+    if pd.isna(std_hist_pra):
+        std_hist_pra = 7.5
+    std_pra = max(std_hist_pra, lambda_pra * 0.22, 6.5)
+    z_pra = (linea_pra - lambda_pra) / std_pra
+    prob_more_pra = min(max((1.0 - norm.cdf(z_pra)) * 100.0, 25.0), 75.0)
+    prob_less_pra = 100.0 - prob_more_pra
+
+    # Evaluar los 4 mercados para encontrar el MEJOR MERCADO (Top Pick) por Edge y Estabilidad
+    mercados_eval = []
+    configs = [
+        ('PTS', lambda_pts, linea_pts, prob_more_pts, prob_less_pts),
+        ('REB', lambda_reb, linea_reb, prob_more_reb, prob_less_reb),
+        ('AST', lambda_ast, linea_ast, prob_more_ast, prob_less_ast),
+        ('PRA', lambda_pra, linea_pra, prob_more_pra, prob_less_pra),
+    ]
+    for m_nom, m_lam, m_lin, p_m, p_l in configs:
+        dir_m = "MÁS" if p_m >= 50.0 else "MENOS"
+        prob_m = max(p_m, p_l)
+        edge_m = round(prob_m - BREAK_EVEN_ODDS_110, 1)
+        hr_m, cv_m, estab_m = calcular_consistencia_y_estabilidad(df_jugador, m_nom, m_lin, dir_m)
+        # Score compuesto: premia Edge %, Hit Rate y penaliza alta volatilidad (CV%)
+        score_calidad = edge_m + (hr_m - 50.0) * 0.12 - max(cv_m - 25.0, 0.0) * 0.15
+        mercados_eval.append({
+            'mercado': m_nom,
+            'direccion': dir_m,
+            'linea': m_lin,
+            'lambda': round(m_lam, 1),
+            'prob': round(prob_m, 1),
+            'edge': edge_m,
+            'hit_rate': hr_m,
+            'cv': cv_m,
+            'estabilidad': estab_m,
+            'score_calidad': score_calidad
+        })
+
+    mejor_mercado = max(mercados_eval, key=lambda x: x['score_calidad'])
 
     return {
         'min_promedio_hist': round(min_promedio_hist, 1),
@@ -899,6 +981,12 @@ def calcular_proyeccion_jugador_capa2_3(
         'lambda_ast': round(lambda_ast, 2),
         'prob_more_ast': round(prob_more_ast, 1),
         'prob_less_ast': round(prob_less_ast, 1),
+        'lambda_pra': round(lambda_pra, 2),
+        'linea_pra': linea_pra,
+        'prob_more_pra': round(prob_more_pra, 1),
+        'prob_less_pra': round(prob_less_pra, 1),
+        'mercados_eval': {m['mercado']: m for m in mercados_eval},
+        'mejor_mercado': mejor_mercado
     }
 
 # ==============================================================================
@@ -987,15 +1075,19 @@ def obtener_datos_en_vivo_espn(event_id):
                     if valores and len(valores) == len(nombres_cols):
                         mapa_s = dict(zip(nombres_cols, valores))
                         min_jugados = parsear_minutos_jugados_boxscore(mapa_s.get("MIN", 0))
+                        pts_a = int(mapa_s.get("PTS", 0)) if str(mapa_s.get("PTS", "0")).isdigit() else 0
+                        reb_a = int(mapa_s.get("REB", 0)) if str(mapa_s.get("REB", "0")).isdigit() else 0
+                        ast_a = int(mapa_s.get("AST", 0)) if str(mapa_s.get("AST", "0")).isdigit() else 0
                         registro_vivo = {
                             "id": id_atl,
                             "nombre": nombre,
                             "equipo": abrev_eq,
                             "dnp": did_not_play,
                             "MIN_ACTUAL": round(min_jugados, 1),
-                            "PTS_ACTUAL": int(mapa_s.get("PTS", 0)) if str(mapa_s.get("PTS", "0")).isdigit() else 0,
-                            "REB_ACTUAL": int(mapa_s.get("REB", 0)) if str(mapa_s.get("REB", "0")).isdigit() else 0,
-                            "AST_ACTUAL": int(mapa_s.get("AST", 0)) if str(mapa_s.get("AST", "0")).isdigit() else 0,
+                            "PTS_ACTUAL": pts_a,
+                            "REB_ACTUAL": reb_a,
+                            "AST_ACTUAL": ast_a,
+                            "PRA_ACTUAL": pts_a + reb_a + ast_a,
                             "FALTAS": int(mapa_s.get("PF", 0)) if str(mapa_s.get("PF", "0")).isdigit() else 0,
                         }
                     else:
@@ -1008,6 +1100,7 @@ def obtener_datos_en_vivo_espn(event_id):
                             "PTS_ACTUAL": 0,
                             "REB_ACTUAL": 0,
                             "AST_ACTUAL": 0,
+                            "PRA_ACTUAL": 0,
                             "FALTAS": 0,
                         }
 
@@ -1141,7 +1234,7 @@ def calcular_ajuste_vivo_capa4(
     }
 
 # ==============================================================================
-# 5. COMPONENTES VISUALES (BARRA BICOLOR DE VICTORIA E INSIGNIAS DE CONFIANZA)
+# 5. COMPONENTES VISUALES
 # ==============================================================================
 
 def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
@@ -1169,16 +1262,17 @@ def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
 
 
 def obtener_html_badge_confianza(prob_rec):
+    edge_val = round(prob_rec - BREAK_EVEN_ODDS_110, 1)
     if prob_rec >= UMBRAL_ALTA_CONFIANZA:
-        return f'<div class="badge-high-conf">🔥 ALTA CONFIANZA ({prob_rec:.1f}%)</div>'
-    return f'<div class="badge-normal-conf">⚖️ Confianza Estándar ({prob_rec:.1f}%)</div>'
+        return f'<div class="badge-high-conf">🔥 ALTA CONFIANZA ({prob_rec:.1f}% | Edge +{edge_val}%)</div>'
+    return f'<div class="badge-normal-conf">⚖️ Estándar ({prob_rec:.1f}% | Edge {edge_val:+.1f}%)</div>'
 
 # ==============================================================================
-# 6. INTERFAZ VISUAL PRINCIPAL Y CONTROLES EN BARRA LATERAL (100% AUTOMATIZADO)
+# 6. INTERFAZ VISUAL PRINCIPAL Y CONTROLES EN BARRA LATERAL
 # ==============================================================================
 
 st.title("🏀 NBA Real-Time Analytics & Backtesting Engine")
-st.markdown(f"Motor Probabilístico Calibrado (Capas 1 a 5): Ponderación Reciente, Regresión Bayesiana, Alta Confianza (≥{UMBRAL_ALTA_CONFIANZA}%) y Marcadores en Vivo.")
+st.markdown("Motor Probabilístico Institucional: **Edge % vs Break-Even (-110)**, **Consistencia L10**, **Estabilidad (CV%)** y **Mejor Mercado (PTS / REB / AST / PRA)**.")
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
@@ -1250,8 +1344,20 @@ altas_manuales_in = st.sidebar.multiselect(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🤖 Filtros, Fatiga y Automatización")
-solo_alta_confianza = st.sidebar.checkbox(f"🔥 Filtrar solo Alta Confianza (≥{UMBRAL_ALTA_CONFIANZA}%) en tablas", value=False)
+st.sidebar.subheader("🎯 Filtros de Calidad de Mercado")
+modo_mercado_resumen = st.sidebar.radio(
+    "Estrategia en Tabla de Jugadores",
+    ["🏆 Mejor Mercado Auto (PTS/REB/AST/PRA)", "🏀 Solo Mercado de Puntos (PTS)"],
+    index=0
+)
+min_edge_filtro = st.sidebar.slider("Edge Mínimo vs Break-Even (%)", min_value=0.0, max_value=15.0, value=4.5, step=0.5)
+min_hit_rate_filtro = st.sidebar.slider("Consistencia Mínima L10 (%)", min_value=0, max_value=90, value=60, step=10)
+excluir_volatiles = st.sidebar.checkbox("Excluir jugadores 🔴 Volátiles (CV > 33%)", value=True)
+aplicar_filtros_calidad = st.sidebar.checkbox("Activar Filtros de Calidad en Tabla Jugadores", value=False)
+solo_alta_confianza_eq = st.sidebar.checkbox("🔥 Solo Alta Confianza (≥62%) en Tabla Equipos", value=False)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 Fatiga y Automatización")
 aplicar_b2b_y_paliza = st.sidebar.checkbox("Ajuste Automático Back-to-Back y Palizas", value=True)
 usar_min_automaticos = st.sidebar.checkbox("Usar Minutos Ajustados Automáticos", value=True)
 min_proj_manual = st.sidebar.slider("Minutos Manuales (si desactivas auto)", min_value=15.0, max_value=42.0, value=32.0, step=0.5)
@@ -1269,7 +1375,7 @@ st.sidebar.caption(
 )
 
 # ==============================================================================
-# 7. CARTELERA ORDENADA POR HORARIO DE ECUADOR (100% AUTOMATIZADA)
+# 7. CARTELERA ORDENADA POR HORARIO DE ECUADOR
 # ==============================================================================
 
 st.subheader(f"📅 Cartelera de Partidos (Hora de Ecuador - UTC-5) — Fecha: {fecha_seleccionada}")
@@ -1354,6 +1460,7 @@ if cartelera_fecha:
             ctx_partido = calcular_contexto_colectivo_capa1(
                 t1_id, t2_id, metricas_equipos, promedios_liga,
                 linea_mercado_ou=partido.get('linea_mercado_ou'),
+                spread_mercado=partido.get('spread_mercado'),
                 t1_en_b2b=t1_b2b,
                 t2_en_b2b=t2_b2b
             )
@@ -1404,13 +1511,13 @@ if cartelera_fecha:
             top_t2 = hallar_top_jugadores_activos(jugadores_t2, ajustes_t2, top_n=2)
 
             def procesar_jugadores_equipo_resumen(lista_top, abrev_eq, ajustes_eq, en_b2b_eq, def_rtg_op):
-                for idx_j, cand_j in enumerate(lista_top):
+                for cand_j in lista_top:
                     nom_j, pts_j, reb_j, ast_j, min_j, stat_j, id_j, df_j_full, df_j_prev = cand_j
                     lineas_auto = calcular_lineas_automaticas_jugador(df_j_prev)
 
                     aj = ajustes_eq.get(nom_j, {})
                     min_aj_c5 = aj.get('min_ajustados', min_j)
-                    min_aj_ctx, notas_min = aplicar_ajustes_fatiga_y_paliza_minutos(
+                    min_aj_ctx, _ = aplicar_ajustes_fatiga_y_paliza_minutos(
                         min_aj_c5, en_b2b=en_b2b_eq, factor_recorte_paliza=factor_paliza_partido
                     )
                     bump = aj.get('factor_usage_bump', 1.0)
@@ -1422,6 +1529,7 @@ if cartelera_fecha:
                         linea_pts=lineas_auto['pts'],
                         linea_reb=lineas_auto['reb'],
                         linea_ast=lineas_auto['ast'],
+                        linea_pra=lineas_auto['pra'],
                         posesiones_partido=ctx_partido['posesiones_esperadas'],
                         def_rtg_rival=def_rtg_op,
                         promedios_liga=promedios_liga,
@@ -1429,34 +1537,50 @@ if cartelera_fecha:
                         min_base_sin_bajas=min_j,
                         en_b2b=en_b2b_eq
                     )
-                    lambda_pts = proy['lambda_pts'] if proy else pts_j
-                    prob_more = proy['prob_more_pts'] if proy else 50.0
-                    rec_pts = "MÁS" if prob_more >= 50.0 else "MENOS"
-                    prob_rec = max(prob_more, 100.0 - prob_more)
-                    es_alta_conf = prob_rec >= UMBRAL_ALTA_CONFIANZA
+                    if not proy:
+                        continue
 
-                    pts_real_str = "-"
-                    reb_real_str = "-"
-                    ast_real_str = "-"
+                    if "Mejor Mercado Auto" in modo_mercado_resumen:
+                        m_sel = proy['mejor_mercado']
+                    else:
+                        m_sel = proy['mercados_eval']['PTS']
+
+                    tipo_m = m_sel['mercado']
+                    dir_m = m_sel['direccion']
+                    linea_m = m_sel['linea']
+                    lambda_m = m_sel['lambda']
+                    prob_m = m_sel['prob']
+                    edge_m = m_sel['edge']
+                    hr_m = m_sel['hit_rate']
+                    cv_m = m_sel['cv']
+                    estab_m = m_sel['estabilidad']
+
+                    es_alta_conf = (prob_m >= UMBRAL_ALTA_CONFIANZA and edge_m >= 5.0 and hr_m >= 60.0 and "Volátil" not in estab_m)
+
+                    real_str = "-"
+                    desglose_str = "-"
                     res_estado = "Pendiente"
 
                     if partido_finalizado:
                         partido_j_fecha = df_j_full[df_j_full['FECHA'] == fecha_busqueda_str]
                         if not partido_j_fecha.empty and partido_j_fecha.iloc[0]['MIN'] > 0:
-                            p_real = partido_j_fecha.iloc[0]['PTS']
-                            r_real = partido_j_fecha.iloc[0]['REB']
-                            a_real = partido_j_fecha.iloc[0]['AST']
-                            pts_real_str = f"{p_real} pts"
-                            reb_real_str = f"{r_real} reb"
-                            ast_real_str = f"{a_real} ast"
-                            res_estado = evaluar_resultado_linea(p_real, lineas_auto['pts'], rec_pts)
+                            p_r = int(partido_j_fecha.iloc[0]['PTS'])
+                            r_r = int(partido_j_fecha.iloc[0]['REB'])
+                            a_r = int(partido_j_fecha.iloc[0]['AST'])
+                            pra_r = p_r + r_r + a_r
+                            mapa_reales = {'PTS': p_r, 'REB': r_r, 'AST': a_r, 'PRA': pra_r}
+                            val_eval = mapa_reales[tipo_m]
+                            real_str = f"{val_eval} {tipo_m}"
+                            desglose_str = f"{p_r}P / {r_r}R / {a_r}A"
+                            res_estado = evaluar_resultado_linea(val_eval, linea_m, dir_m)
                         elif datos_vivo_p:
                             jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
                             if jv and jv["MIN_ACTUAL"] > 0:
-                                pts_real_str = f"{jv['PTS_ACTUAL']} pts"
-                                reb_real_str = f"{jv['REB_ACTUAL']} reb"
-                                ast_real_str = f"{jv['AST_ACTUAL']} ast"
-                                res_estado = evaluar_resultado_linea(jv['PTS_ACTUAL'], lineas_auto['pts'], rec_pts)
+                                mapa_reales = {'PTS': jv['PTS_ACTUAL'], 'REB': jv['REB_ACTUAL'], 'AST': jv['AST_ACTUAL'], 'PRA': jv['PRA_ACTUAL']}
+                                val_eval = mapa_reales[tipo_m]
+                                real_str = f"{val_eval} {tipo_m}"
+                                desglose_str = f"{jv['PTS_ACTUAL']}P / {jv['REB_ACTUAL']}R / {jv['AST_ACTUAL']}A"
+                                res_estado = evaluar_resultado_linea(val_eval, linea_m, dir_m)
                             else:
                                 res_estado = "No jugó"
                         else:
@@ -1465,32 +1589,38 @@ if cartelera_fecha:
                     elif partido_en_vivo and datos_vivo_p:
                         jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
                         if jv:
-                            pts_real_str = f"🔴 {jv['PTS_ACTUAL']} pts ({jv['MIN_ACTUAL']:.0f}m)"
-                            reb_real_str = f"{jv['REB_ACTUAL']}"
-                            ast_real_str = f"{jv['AST_ACTUAL']}"
-                            if rec_pts == "MÁS" and jv['PTS_ACTUAL'] > lineas_auto['pts']:
+                            mapa_v = {'PTS': jv['PTS_ACTUAL'], 'REB': jv['REB_ACTUAL'], 'AST': jv['AST_ACTUAL'], 'PRA': jv['PRA_ACTUAL']}
+                            val_v = mapa_v[tipo_m]
+                            real_str = f"🔴 {val_v} {tipo_m} ({jv['MIN_ACTUAL']:.0f}m)"
+                            desglose_str = f"{jv['PTS_ACTUAL']}P / {jv['REB_ACTUAL']}R / {jv['AST_ACTUAL']}A"
+                            if dir_m == "MÁS" and val_v > linea_m:
                                 res_estado = "🟢 Superada (Vivo)"
-                            elif rec_pts == "MENOS" and jv['PTS_ACTUAL'] > lineas_auto['pts']:
+                            elif dir_m == "MENOS" and val_v > linea_m:
                                 res_estado = "🔴 Superada en contra"
                             else:
                                 res_estado = f"⏳ En juego ({partido['estado']})"
 
                     resumen_jugadores.append({
-                        'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf else 'Estándar',
+                        'Nivel': '🔥 TOP PICK' if es_alta_conf else 'Estándar',
                         'Encuentro': partido['encuentro'],
                         'Jugador': nom_j,
                         'Equipo': abrev_eq,
-                        'Estatus': stat_j,
+                        'Mercado': tipo_m,
                         'Min Proy.': round(min_eval, 1),
-                        'Λ Pts': lambda_pts,
-                        'Línea Pts': lineas_auto['pts'],
-                        'Predicción Pts': f"{rec_pts} {lineas_auto['pts']}",
-                        'Prob_Num': round(prob_rec, 1),
-                        'Prob.': f"{prob_rec:.1f}%",
-                        'Proy. REB/AST': f"{proy['lambda_reb']:.1f}R / {proy['lambda_ast']:.1f}A",
-                        'Real / Vivo': pts_real_str,
-                        'REB/AST Real': f"{reb_real_str} / {ast_real_str}" if reb_real_str != "-" else "-",
-                        'Resultado': res_estado
+                        'Λ Proy.': lambda_m,
+                        'Línea': linea_m,
+                        'Recomendación': f"{dir_m} {linea_m} {tipo_m}",
+                        'Prob.': f"{prob_m:.1f}%",
+                        'Edge %': f"{edge_m:+.1f}%",
+                        'Hit Rate L10': f"{int(hr_m)}%",
+                        'Estabilidad': f"{estab_m} ({cv_m}%)",
+                        'Real / Vivo': real_str,
+                        'Boxscore': desglose_str,
+                        'Resultado': res_estado,
+                        '_edge_num': edge_m,
+                        '_hr_num': hr_m,
+                        '_estab_txt': estab_m,
+                        '_score_calidad': m_sel['score_calidad']
                     })
 
             procesar_jugadores_equipo_resumen(top_t1, partido['abrev_t1'], ajustes_t1, t1_b2b, ctx_partido['eq2_stats']['def_rtg'])
@@ -1509,24 +1639,24 @@ if cartelera_fecha:
                     min_eval_1 = min_aj_ctx_1 if usar_min_automaticos else min_proj_manual
                     proy_1 = calcular_proyeccion_jugador_capa2_3(
                         df_jugador=df_j1_prev, minutos_proyectados=min_eval_1,
-                        linea_pts=lineas_auto_1['pts'], linea_reb=lineas_auto_1['reb'], linea_ast=lineas_auto_1['ast'],
+                        linea_pts=lineas_auto_1['pts'], linea_reb=lineas_auto_1['reb'],
+                        linea_ast=lineas_auto_1['ast'], linea_pra=lineas_auto_1['pra'],
                         posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq2_stats']['def_rtg'],
                         promedios_liga=promedios_liga, factor_usage_bump=aj_1.get('factor_usage_bump', 1.0),
                         min_base_sin_bajas=min_1, en_b2b=t1_b2b
                     )
-                    lambda_p1 = proy_1['lambda_pts'] if proy_1 else pts_1
-                    prob_p1 = proy_1['prob_more_pts'] if proy_1 else 50.0
-                    prob_rec_1 = max(prob_p1, 100.0 - prob_p1)
-                    es_alta_conf_1 = prob_rec_1 >= UMBRAL_ALTA_CONFIANZA
-
+                    mm1 = proy_1['mejor_mercado']
                     etiqueta_extra_1 = f" | {', '.join(notas_min_1)}" if notas_min_1 else ""
-                    sello_exp_1 = " 🔥 ALTA CONFIANZA" if es_alta_conf_1 else ""
-                    with st.expander(f"⭐ {partido['abrev_t1']} - {nom_1} (Λ: {lambda_p1:.1f} vs Línea {lineas_auto_1['pts']}{etiqueta_extra_1}){sello_exp_1}"):
-                        st.markdown(obtener_html_badge_confianza(prob_rec_1), unsafe_allow_html=True)
-                        st.markdown(f"**Estatus:** {stat_1} | **Minutos:** {min_1:.1f} → **{min_eval_1:.1f} min**")
+                    sello_exp_1 = f" 🔥 {mm1['direccion']} {mm1['linea']} {mm1['mercado']} (Edge {mm1['edge']:+.1f}%)" if mm1['edge'] >= 4.5 else ""
+                    with st.expander(f"⭐ {partido['abrev_t1']} - {nom_1} (PTS Λ: {proy_1['lambda_pts']:.1f} vs {lineas_auto_1['pts']}{etiqueta_extra_1}){sello_exp_1}"):
+                        st.markdown(obtener_html_badge_confianza(mm1['prob']), unsafe_allow_html=True)
+                        st.markdown(
+                            f"**Mejor Mercado:** `{mm1['direccion']} {mm1['linea']} {mm1['mercado']}` (Λ: {mm1['lambda']}) | "
+                            f"**Hit Rate L10:** {int(mm1['hit_rate'])}% | **Estabilidad:** {mm1['estabilidad']}"
+                        )
                         st.metric(
-                            f"Proyección vs Líneas Auto ({lineas_auto_1['pts']}P / {lineas_auto_1['reb']}R / {lineas_auto_1['ast']}A)",
-                            f"{lambda_p1:.1f} PTS | {proy_1['lambda_reb']:.1f} REB | {proy_1['lambda_ast']:.1f} AST"
+                            f"Proyección Completa ({lineas_auto_1['pts']}P / {lineas_auto_1['reb']}R / {lineas_auto_1['ast']}A / {lineas_auto_1['pra']} PRA)",
+                            f"{proy_1['lambda_pts']:.1f} P | {proy_1['lambda_reb']:.1f} R | {proy_1['lambda_ast']:.1f} A | {proy_1['lambda_pra']:.1f} PRA"
                         )
                         if st.button(f"Analizar a {nom_1} en Vivo / Detalle", key=f"btn_{id_1}_{partido['event_id']}"):
                             st.session_state['jugador_seleccionado'] = nom_1
@@ -1545,24 +1675,24 @@ if cartelera_fecha:
                     min_eval_2 = min_aj_ctx_2 if usar_min_automaticos else min_proj_manual
                     proy_2 = calcular_proyeccion_jugador_capa2_3(
                         df_jugador=df_j2_prev, minutos_proyectados=min_eval_2,
-                        linea_pts=lineas_auto_2['pts'], linea_reb=lineas_auto_2['reb'], linea_ast=lineas_auto_2['ast'],
+                        linea_pts=lineas_auto_2['pts'], linea_reb=lineas_auto_2['reb'],
+                        linea_ast=lineas_auto_2['ast'], linea_pra=lineas_auto_2['pra'],
                         posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq1_stats']['def_rtg'],
                         promedios_liga=promedios_liga, factor_usage_bump=aj_2.get('factor_usage_bump', 1.0),
                         min_base_sin_bajas=min_2, en_b2b=t2_b2b
                     )
-                    lambda_p2 = proy_2['lambda_pts'] if proy_2 else pts_2
-                    prob_p2 = proy_2['prob_more_pts'] if proy_2 else 50.0
-                    prob_rec_2 = max(prob_p2, 100.0 - prob_p2)
-                    es_alta_conf_2 = prob_rec_2 >= UMBRAL_ALTA_CONFIANZA
-
+                    mm2 = proy_2['mejor_mercado']
                     etiqueta_extra_2 = f" | {', '.join(notas_min_2)}" if notas_min_2 else ""
-                    sello_exp_2 = " 🔥 ALTA CONFIANZA" if es_alta_conf_2 else ""
-                    with st.expander(f"⭐ {partido['abrev_t2']} - {nom_2} (Λ: {lambda_p2:.1f} vs Línea {lineas_auto_2['pts']}{etiqueta_extra_2}){sello_exp_2}"):
-                        st.markdown(obtener_html_badge_confianza(prob_rec_2), unsafe_allow_html=True)
-                        st.markdown(f"**Estatus:** {stat_2} | **Minutos:** {min_2:.1f} → **{min_eval_2:.1f} min**")
+                    sello_exp_2 = f" 🔥 {mm2['direccion']} {mm2['linea']} {mm2['mercado']} (Edge {mm2['edge']:+.1f}%)" if mm2['edge'] >= 4.5 else ""
+                    with st.expander(f"⭐ {partido['abrev_t2']} - {nom_2} (PTS Λ: {proy_2['lambda_pts']:.1f} vs {lineas_auto_2['pts']}{etiqueta_extra_2}){sello_exp_2}"):
+                        st.markdown(obtener_html_badge_confianza(mm2['prob']), unsafe_allow_html=True)
+                        st.markdown(
+                            f"**Mejor Mercado:** `{mm2['direccion']} {mm2['linea']} {mm2['mercado']}` (Λ: {mm2['lambda']}) | "
+                            f"**Hit Rate L10:** {int(mm2['hit_rate'])}% | **Estabilidad:** {mm2['estabilidad']}"
+                        )
                         st.metric(
-                            f"Proyección vs Líneas Auto ({lineas_auto_2['pts']}P / {lineas_auto_2['reb']}R / {lineas_auto_2['ast']}A)",
-                            f"{lambda_p2:.1f} PTS | {proy_2['lambda_reb']:.1f} REB | {proy_2['lambda_ast']:.1f} AST"
+                            f"Proyección Completa ({lineas_auto_2['pts']}P / {lineas_auto_2['reb']}R / {lineas_auto_2['ast']}A / {lineas_auto_2['pra']} PRA)",
+                            f"{proy_2['lambda_pts']:.1f} P | {proy_2['lambda_reb']:.1f} R | {proy_2['lambda_ast']:.1f} A | {proy_2['lambda_pra']:.1f} PRA"
                         )
                         if st.button(f"Analizar a {nom_2} en Vivo / Detalle", key=f"btn_{id_2}_{partido['event_id']}"):
                             st.session_state['jugador_seleccionado'] = nom_2
@@ -1578,6 +1708,8 @@ if cartelera_fecha:
             prob_total_rec = ctx_partido['prob_over_total'] if is_more_partido else (100.0 - ctx_partido['prob_over_total'])
             ganador_recomendado = partido['abrev_t1'] if prob_t1 >= prob_t2 else partido['abrev_t2']
             max_prob_val = max(prob_t1, prob_t2)
+            edge_ml = round(max_prob_val - BREAK_EVEN_ODDS_110, 1)
+            edge_ou = round(prob_total_rec - BREAK_EVEN_ODDS_110, 1)
             es_alta_conf_eq = max_prob_val >= 62.0 or prob_total_rec >= 62.0
 
             s1 = partido['score_t1']
@@ -1596,11 +1728,11 @@ if cartelera_fecha:
                     'Marcador': f"🏁 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
                     'Ganador Sugerido': ganador_recomendado,
                     'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
-                    'Prob. Victoria': max_prob_val,
+                    'Prob. Victoria': f"{max_prob_val:.1f}% (Edge {edge_ml:+.1f}%)",
                     'Resultado Ganador': acerto_ganador,
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
-                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}%)",
+                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)",
                     'Total Real / Vivo': f"{total_actual} pts",
                     'Resultado Total': cumplio_total,
                     'Estado': 'Finalizado'
@@ -1626,11 +1758,11 @@ if cartelera_fecha:
                     'Marcador': f"🔴 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
                     'Ganador Sugerido': ganador_recomendado,
                     'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
-                    'Prob. Victoria': max_prob_val,
+                    'Prob. Victoria': f"{max_prob_val:.1f}% (Edge {edge_ml:+.1f}%)",
                     'Resultado Ganador': estado_ganador_vivo,
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
-                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}%)",
+                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)",
                     'Total Real / Vivo': f"🔴 {total_actual} pts",
                     'Resultado Total': f"⏳ {partido['estado']}",
                     'Estado': f"🔴 {partido['estado']}"
@@ -1639,12 +1771,12 @@ if cartelera_fecha:
                 col_r1, col_r2 = st.columns(2)
                 with col_r1:
                     sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= 62.0 else ""
-                    st.success(f"🏆 **Ganador Recomendado:** **{ganador_recomendado}** ({max_prob_val:.1f}%){sello_ml} | Vivo: **{estado_ganador_vivo}**")
+                    st.success(f"🏆 **Ganador Recomendado:** **{ganador_recomendado}** ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%){sello_ml} | Vivo: **{estado_ganador_vivo}**")
                 with col_r2:
                     sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= 62.0 else ""
                     st.warning(
                         f"📈 **Total Partido (Línea {linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → "
-                        f"**{verdict_partido_total} ({prob_total_rec:.1f}%)**{sello_ou} | Acumulado: **{total_actual} pts**"
+                        f"**{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)**{sello_ou} | Acumulado: **{total_actual} pts**"
                     )
             else:
                 resumen_equipos.append({
@@ -1654,11 +1786,11 @@ if cartelera_fecha:
                     'Marcador': '-',
                     'Ganador Sugerido': ganador_recomendado,
                     'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
-                    'Prob. Victoria': max_prob_val,
+                    'Prob. Victoria': f"{max_prob_val:.1f}% (Edge {edge_ml:+.1f}%)",
                     'Resultado Ganador': 'Pendiente',
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
-                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}%)",
+                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)",
                     'Total Real / Vivo': '-',
                     'Resultado Total': 'Pendiente',
                     'Estado': partido['estado']
@@ -1667,12 +1799,12 @@ if cartelera_fecha:
                 col_r1, col_r2 = st.columns(2)
                 with col_r1:
                     sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= 62.0 else ""
-                    st.success(f"🏆 **Ganador Recomendado (Moneyline):** **{ganador_recomendado}** ({max_prob_val:.1f}%){sello_ml}")
+                    st.success(f"🏆 **Ganador Recomendado (Moneyline):** **{ganador_recomendado}** ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%){sello_ml}")
                 with col_r2:
                     sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= 62.0 else ""
                     st.warning(
                         f"📈 **Total Partido (Línea {linea_ou_partido} - {origen_ou_partido}):** "
-                        f"Proyección {total_proyectado_partido:.1f} pts → **RECOMENDACIÓN: {verdict_partido_total} ({prob_total_rec:.1f}%)**{sello_ou}"
+                        f"Proyección {total_proyectado_partido:.1f} pts → **RECOMENDACIÓN: {verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)**{sello_ou}"
                     )
 
             renderizar_barra_probabilidad_dual(partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2)
@@ -1681,15 +1813,15 @@ else:
     st.info(f"No hay partidos registrados en la cartelera oficial para la fecha: {fecha_seleccionada}.")
 
 # ==============================================================================
-# 8. RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES ESTELARES (CON MARCADORES EN VIVO)
+# 8. RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES (ORDENADO POR CALIDAD DE MERCADO)
 # ==============================================================================
 
 if resumen_equipos:
     st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos y Marcadores en Vivo")
-    st.markdown("Tabla sincronizada en tiempo real con **marcadores en vivo (`🔴`)**, totales acumulados, líneas O/U e insignia **🔥 ALTA CONFIANZA**.")
+    st.markdown("Incluye **Edge % frente al Break-Even (-110 = 52.38%)** y marcadores sincronizados en tiempo real.")
    
     df_equipos = pd.DataFrame(resumen_equipos)
-    if solo_alta_confianza:
+    if solo_alta_confianza_eq:
         df_equipos = df_equipos[df_equipos['Prob_Max_Num'] >= 62.0]
 
     df_equipos_export = df_equipos.drop(columns=['Prob_Max_Num'], errors='ignore').copy()
@@ -1701,21 +1833,31 @@ if resumen_equipos:
             file_name=f"nba_equipos_{fecha_seleccionada}.csv",
             mime="text/csv",
         )
-        df_equipos_export['Prob. Victoria'] = df_equipos_export['Prob. Victoria'].apply(lambda x: f"{x:.1f}%")
         st.dataframe(df_equipos_export, use_container_width=True, hide_index=True)
     else:
         st.info("Ningún encuentro supera el umbral de Alta Confianza en esta jornada.")
     st.markdown("---")
 
 if resumen_jugadores:
-    st.subheader("⭐ Resumen Ejecutivo: Figuras Sanas Activas y Progreso en Vivo")
-    st.markdown(f"Calibrado con **ponderación reciente (55% L5)** y **regresión bayesiana** (Alta Confianza ≥{UMBRAL_ALTA_CONFIANZA}%).")
+    st.subheader("⭐ Resumen Ejecutivo: Mejores Mercados de Jugadores (Ordenados por Calidad)")
+    st.markdown(
+        "Ordenado automáticamente de **mayor a menor calidad estadística** combinando **Edge %**, **Hit Rate L10** y **Estabilidad (CV%)**."
+    )
    
     df_jugadores_res = pd.DataFrame(resumen_jugadores)
-    if solo_alta_confianza:
-        df_jugadores_res = df_jugadores_res[df_jugadores_res['Prob_Num'] >= UMBRAL_ALTA_CONFIANZA]
+    df_jugadores_res = df_jugadores_res.sort_values(by='_score_calidad', ascending=False)
 
-    df_jugadores_export = df_jugadores_res.drop(columns=['Prob_Num'], errors='ignore').copy()
+    if aplicar_filtros_calidad:
+        df_jugadores_res = df_jugadores_res[
+            (df_jugadores_res['_edge_num'] >= min_edge_filtro) &
+            (df_jugadores_res['_hr_num'] >= min_hit_rate_filtro)
+        ]
+        if excluir_volatiles:
+            df_jugadores_res = df_jugadores_res[~df_jugadores_res['_estab_txt'].str.contains("Volátil", na=False)]
+
+    cols_ocultas = ['_edge_num', '_hr_num', '_estab_txt', '_score_calidad']
+    df_jugadores_export = df_jugadores_res.drop(columns=cols_ocultas, errors='ignore').copy()
+
     if not df_jugadores_export.empty:
         csv_jugadores = df_jugadores_export.to_csv(index=False).encode('utf-8')
         st.download_button(
@@ -1726,7 +1868,7 @@ if resumen_jugadores:
         )
         st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True)
     else:
-        st.info(f"Ningún jugador activo supera el umbral de Alta Confianza (≥{UMBRAL_ALTA_CONFIANZA}%) en esta jornada.")
+        st.info("Ningún jugador cumple los filtros estrictos de calidad seleccionados en el sidebar. Prueba bajar el Edge Mínimo o desactivar el filtro.")
     st.markdown("---")
 
 # ==============================================================================
@@ -1773,6 +1915,7 @@ if jugador_activo:
         linea_pts_eval = linea_pts_manual if sobreescribir_lineas else lineas_auto_j['pts']
         linea_reb_eval = linea_reb_manual if sobreescribir_lineas else lineas_auto_j['reb']
         linea_ast_eval = linea_ast_manual if sobreescribir_lineas else lineas_auto_j['ast']
+        linea_pra_eval = round(linea_pts_eval + linea_reb_eval + linea_ast_eval - 0.5, 1) if sobreescribir_lineas else lineas_auto_j['pra']
         origen_lineas_j = "Manual" if sobreescribir_lineas else "Auto-Calculada"
 
         st.subheader(f"📊 Historial y Rendimiento Real: {jugador_activo} ({equipo_jugador})")
@@ -1807,6 +1950,7 @@ if jugador_activo:
                 metricas_equipos,
                 promedios_liga,
                 linea_mercado_ou=evento_jugador.get('linea_mercado_ou'),
+                spread_mercado=evento_jugador.get('spread_mercado'),
                 t1_en_b2b=t1_b2b_ev,
                 t2_en_b2b=t2_b2b_ev
             )
@@ -1833,6 +1977,7 @@ if jugador_activo:
             linea_pts=linea_pts_eval,
             linea_reb=linea_reb_eval,
             linea_ast=linea_ast_eval,
+            linea_pra=linea_pra_eval,
             posesiones_partido=posesiones_ctx,
             def_rtg_rival=def_rtg_rival_ctx,
             promedios_liga=promedios_liga,
@@ -1880,7 +2025,7 @@ if jugador_activo:
                             
                         act = res_vivo["actual"]
                         st.caption(
-                            f"📊 **Progreso Actual en Cancha:** **{act['PTS_ACTUAL']} PTS, {act['REB_ACTUAL']} REB, {act['AST_ACTUAL']} AST** "
+                            f"📊 **Progreso Actual en Cancha:** **{act['PTS_ACTUAL']} PTS, {act['REB_ACTUAL']} REB, {act['AST_ACTUAL']} AST ({act['PRA_ACTUAL']} PRA)** "
                             f"en {act['MIN_ACTUAL']:.1f} min ({act['FALTAS']} faltas) | "
                             f"Minutos restantes estimados: **{res_vivo['min_restantes_ajustados']} min**"
                         )
@@ -1916,73 +2061,14 @@ if jugador_activo:
             panel_en_vivo_capa4()
 
         if proy_detallada:
-            lambda_pts = proy_detallada['lambda_pts']
-            prob_more_pts = proy_detallada['prob_more_pts']
-            prob_less_pts = proy_detallada['prob_less_pts']
-            rec_pts_hist = "MÁS" if prob_more_pts >= 50.0 else "MENOS"
-
-            lambda_reb = proy_detallada['lambda_reb']
-            prob_more_reb = proy_detallada['prob_more_reb']
-            prob_less_reb = proy_detallada['prob_less_reb']
-            rec_reb_hist = "MÁS" if prob_more_reb >= 50.0 else "MENOS"
-
-            lambda_ast = proy_detallada['lambda_ast']
-            prob_more_ast = proy_detallada['prob_more_ast']
-            prob_less_ast = proy_detallada['prob_less_ast']
-            rec_ast_hist = "MÁS" if prob_more_ast >= 50.0 else "MENOS"
-
-            partido_en_fecha = df_jugador_full[df_jugador_full['FECHA'] == fecha_busqueda_str]
-
-            if not partido_en_fecha.empty and partido_en_fecha.iloc[0]['MIN'] > 0:
-                st.markdown("---")
-                st.subheader(f"🔍 Auditoría y Verificación de Objetivos ({origen_lineas_j}) para el {fecha_busqueda_str}")
-               
-                p_real = partido_en_fecha.iloc[0]['PTS']
-                r_real = partido_en_fecha.iloc[0]['REB']
-                a_real = partido_en_fecha.iloc[0]['AST']
-                min_real = partido_en_fecha.iloc[0]['MIN']
-
-                col_b1, col_b2, col_b3 = st.columns(3)
-               
-                with col_b1:
-                    res_txt_p = evaluar_resultado_linea(p_real, linea_pts_eval, rec_pts_hist)
-                    css_p = "card-over" if "Acierto" in res_txt_p else ("card-push" if "Push" in res_txt_p else "card-under")
-                    st.markdown(f"""
-                        <div class="{css_p}">
-                            <h4 style="margin:0; color:white;">Puntos: {p_real} (Línea: {linea_pts_eval})</h4>
-                            <p style="margin:5px 0 0 0; font-size:15px; font-weight:bold;">{res_txt_p}</p>
-                            <p style="margin:2px 0; font-size:13px; color:#cbd5e1;">Se recomendó: <b>{rec_pts_hist} {linea_pts_eval}</b> (Λ: {lambda_pts})</p>
-                            <p style="margin:0; font-size:12px; color:#94a3b8;">Minutos jugados: {min_real:.0f} min</p>
-                        </div>
-                    """, unsafe_allow_html=True)
-
-                with col_b2:
-                    res_txt_r = evaluar_resultado_linea(r_real, linea_reb_eval, rec_reb_hist)
-                    css_r = "card-over" if "Acierto" in res_txt_r else ("card-push" if "Push" in res_txt_r else "card-under")
-                    st.markdown(f"""
-                        <div class="{css_r}">
-                            <h4 style="margin:0; color:white;">Rebotes: {r_real} (Línea: {linea_reb_eval})</h4>
-                            <p style="margin:5px 0 0 0; font-size:15px; font-weight:bold;">{res_txt_r}</p>
-                            <p style="margin:2px 0; font-size:13px; color:#cbd5e1;">Se recomendó: <b>{rec_reb_hist} {linea_reb_eval}</b> (Λ: {lambda_reb})</p>
-                            <p style="margin:0; font-size:12px; color:#94a3b8;">Minutos jugados: {min_real:.0f} min</p>
-                        </div>
-                    """, unsafe_allow_html=True)
-
-                with col_b3:
-                    res_txt_a = evaluar_resultado_linea(a_real, linea_ast_eval, rec_ast_hist)
-                    css_a = "card-over" if "Acierto" in res_txt_a else ("card-push" if "Push" in res_txt_a else "card-under")
-                    st.markdown(f"""
-                        <div class="{css_a}">
-                            <h4 style="margin:0; color:white;">Asistencias: {a_real} (Línea: {linea_ast_eval})</h4>
-                            <p style="margin:5px 0 0 0; font-size:15px; font-weight:bold;">{res_txt_a}</p>
-                            <p style="margin:2px 0; font-size:13px; color:#cbd5e1;">Se recomendó: <b>{rec_ast_hist} {linea_ast_eval}</b> (Λ: {lambda_ast})</p>
-                            <p style="margin:0; font-size:12px; color:#94a3b8;">Minutos jugados: {min_real:.0f} min</p>
-                        </div>
-                    """, unsafe_allow_html=True)
-                st.markdown("---")
-
+            mm_j = proy_detallada['mejor_mercado']
             st.markdown("---")
             st.subheader(f"🎯 Reporte Probabilístico Integral ({origen_lineas_j}): {jugador_activo}")
+            st.success(
+                f"🏆 **Mejor Mercado Recomendado:** **{mm_j['direccion']} {mm_j['linea']} {mm_j['mercado']}** "
+                f"(Λ: {mm_j['lambda']} | Prob: {mm_j['prob']}% | **Edge {mm_j['edge']:+.1f}%** | "
+                f"Hit Rate L10: **{int(mm_j['hit_rate'])}%** | Estabilidad: **{mm_j['estabilidad']}**)"
+            )
             st.caption(
                 f"⚙️ **Contexto Aplicado:** Minutos Proyectados = **{minutos_proyectados_final:.1f} min** | "
                 f"Rival = **{rival_abrev_ctx}** | Ritmo = **{proy_detallada['factor_ritmo']}x** | "
@@ -1991,61 +2077,31 @@ if jugador_activo:
                 f"Riesgo Paliza = **{riesgo_paliza_txt}**"
             )
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
-            with col1:
-                is_more_pts = prob_more_pts >= 50.0
-                prob_rec_p = max(prob_more_pts, prob_less_pts)
-                extra_glow_p = " card-high-conf" if prob_rec_p >= UMBRAL_ALTA_CONFIANZA else ""
-                css_box_p = ("card-over" if is_more_pts else "card-under") + extra_glow_p
-                badge_p = obtener_html_badge_confianza(prob_rec_p)
-                verdict_pts = f"🟢 RECOMENDACIÓN: MÁS {linea_pts_eval}" if is_more_pts else f"🔴 RECOMENDACIÓN: MENOS {linea_pts_eval}"
-                st.markdown(f"""
-                    <div class="{css_box_p}">
-                        {badge_p}
-                        <h4 style="margin:0; color:white;">🏀 PUNTOS (Línea {origen_lineas_j}: {linea_pts_eval})</h4>
-                        <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proyectado: {lambda_pts:.2f} pts</p>
-                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Ponderada: {proy_detallada['tasa_pts_min']:.2f} pts/min</p>
-                        <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">{verdict_pts}</p>
-                        <p style="margin:0; font-size:12px; color:#cbd5e1;">Más: {prob_more_pts:.1f}% | Menos: {prob_less_pts:.1f}%</p>
-                    </div>
-                """, unsafe_allow_html=True)
-                st.progress(min(max(int(prob_more_pts), 0), 100))
+            for col_ui, m_key, titulo_m in [
+                (col1, 'PTS', '🏀 PUNTOS'),
+                (col2, 'REB', '📊 REBOTES'),
+                (col3, 'AST', '🎯 ASISTENCIAS'),
+                (col4, 'PRA', '🔥 PRA (P+R+A)')
+            ]:
+                with col_ui:
+                    m_dat = proy_detallada['mercados_eval'][m_key]
+                    is_more = m_dat['direccion'] == "MÁS"
+                    extra_glow = " card-high-conf" if (m_dat['prob'] >= UMBRAL_ALTA_CONFIANZA and m_dat['edge'] >= 4.5) else ""
+                    css_box = ("card-over" if is_more else "card-under") + extra_glow
+                    badge_m = obtener_html_badge_confianza(m_dat['prob'])
+                    verdict_m = f"🟢 {m_dat['direccion']} {m_dat['linea']}" if is_more else f"🔴 {m_dat['direccion']} {m_dat['linea']}"
+                    p_more_bar = m_dat['prob'] if is_more else (100.0 - m_dat['prob'])
 
-            with col2:
-                is_more_reb = prob_more_reb >= 50.0
-                prob_rec_r = max(prob_more_reb, prob_less_reb)
-                extra_glow_r = " card-high-conf" if prob_rec_r >= UMBRAL_ALTA_CONFIANZA else ""
-                css_box_r = ("card-over" if is_more_reb else "card-under") + extra_glow_r
-                badge_r = obtener_html_badge_confianza(prob_rec_r)
-                verdict_reb = f"🟢 RECOMENDACIÓN: MÁS {linea_reb_eval}" if is_more_reb else f"🔴 RECOMENDACIÓN: MENOS {linea_reb_eval}"
-                st.markdown(f"""
-                    <div class="{css_box_r}">
-                        {badge_r}
-                        <h4 style="margin:0; color:white;">📊 REBOTES (Línea {origen_lineas_j}: {linea_reb_eval})</h4>
-                        <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proyectado: {lambda_reb:.2f} reb</p>
-                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Ponderada: {proy_detallada['tasa_reb_min']:.2f} reb/min</p>
-                        <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">{verdict_reb}</p>
-                        <p style="margin:0; font-size:12px; color:#cbd5e1;">Más: {prob_more_reb:.1f}% | Menos: {prob_less_reb:.1f}%</p>
-                    </div>
-                """, unsafe_allow_html=True)
-                st.progress(min(max(int(prob_more_reb), 0), 100))
-
-            with col3:
-                is_more_ast = prob_more_ast >= 50.0
-                prob_rec_a = max(prob_more_ast, prob_less_ast)
-                extra_glow_a = " card-high-conf" if prob_rec_a >= UMBRAL_ALTA_CONFIANZA else ""
-                css_box_a = ("card-over" if is_more_ast else "card-under") + extra_glow_a
-                badge_a = obtener_html_badge_confianza(prob_rec_a)
-                verdict_ast = f"🟢 RECOMENDACIÓN: MÁS {linea_ast_eval}" if is_more_ast else f"🔴 RECOMENDACIÓN: MENOS {linea_ast_eval}"
-                st.markdown(f"""
-                    <div class="{css_box_a}">
-                        {badge_a}
-                        <h4 style="margin:0; color:white;">🎯 ASISTENCIAS (Línea {origen_lineas_j}: {linea_ast_eval})</h4>
-                        <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proyectado: {lambda_ast:.2f} ast</p>
-                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Ponderada: {proy_detallada['tasa_ast_min']:.2f} ast/min</p>
-                        <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">{verdict_ast}</p>
-                        <p style="margin:0; font-size:12px; color:#cbd5e1;">Más: {prob_more_ast:.1f}% | Menos: {prob_less_ast:.1f}%</p>
-                    </div>
-                """, unsafe_allow_html=True)
-                st.progress(min(max(int(prob_more_ast), 0), 100))
+                    st.markdown(f"""
+                        <div class="{css_box}">
+                            {badge_m}
+                            <h4 style="margin:0; color:white;">{titulo_m} (Línea: {m_dat['linea']})</h4>
+                            <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proy: {m_dat['lambda']}</p>
+                            <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Hit Rate L10: {int(m_dat['hit_rate'])}% | {m_dat['estabilidad']}</p>
+                            <p style="margin:5px 0 0 0; font-size:17px; font-weight:bold;">{verdict_m}</p>
+                            <p style="margin:0; font-size:12px; color:#cbd5e1;">Prob: {m_dat['prob']:.1f}% | Edge: {m_dat['edge']:+.1f}%</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+                    st.progress(min(max(int(p_more_bar), 0), 100))
