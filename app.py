@@ -125,9 +125,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-UMBRAL_ALTA_CONFIANZA = 62.0
+# Umbral calibrado para probabilidades realistas (58.5% en props equivale a ventaja estadística real)
+UMBRAL_ALTA_CONFIANZA = 58.5
 
-# Palabras clave que descalifican automáticamente a un jugador de ser recomendado
 ESTATUS_NO_DISPONIBLE = [
     'out', 'injured', 'injury', 'doubtful', 'suspension', 'suspended',
     'inactive', 'g-league', 'g league', 'not with team', 'personal', 'rest'
@@ -184,7 +184,6 @@ def obtener_cartelera_por_fecha(fecha_str):
                     except (ValueError, TypeError):
                         linea_mercado_ou = None
 
-            # Extraer reporte de lesiones oficial del partido (injuries en competitions)
             bajas_evento_ids = set()
             bajas_evento_nombres = set()
             for grp_inj in competitions.get('injuries', []):
@@ -243,10 +242,9 @@ def obtener_cartelera_por_fecha(fecha_str):
 
 @st.cache_data(ttl=1800)
 def obtener_reporte_lesiones_liga():
-    """Consulta el endpoint global de lesiones NBA de ESPN para detectar bajas de última hora."""
     url_inj = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
     headers = {'User-Agent': 'Mozilla/5.0'}
-    bajas_globales = {}  # id_espn -> status
+    bajas_globales = {}
     try:
         res = requests.get(url_inj, headers=headers, timeout=8).json()
         for eq_block in res.get('injuries', []):
@@ -368,7 +366,6 @@ def obtener_mapa_jugadores_completo():
                 id_atleta = str(atleta.get('id', ''))
                 status_roster = atleta.get('status', {}).get('name', 'Active') or 'Active'
                 
-                # Cruzar también con el reporte de lesiones oficial de la liga
                 status_lesion_global = lesiones_liga.get(id_atleta, '')
                 if status_lesion_global and es_estatus_baja(status_lesion_global):
                     status_final = f"Out ({status_lesion_global})"
@@ -444,7 +441,62 @@ def obtener_historial_previo_sin_leakage(df_jugador, fecha_limite_str):
     return df_previo if not df_previo.empty else df_jugador
 
 
+def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
+    """
+    Ponderación exponencial reciente para evitar proyecciones infladas en jugadores
+    que regresan de lesión o vienen con restricción de minutos:
+    55% últimos 5 juegos + 30% juegos 6-10 + 15% resto de temporada.
+    """
+    if df_jugador_previo is None or df_jugador_previo.empty:
+        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
+
+    df_v = df_jugador_previo[df_jugador_previo['MIN'] > 0]
+    if df_v.empty:
+        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
+
+    df_5 = df_v.head(5)
+    df_10 = df_v.head(10)
+
+    def pond_col(col):
+        v5 = df_5[col].mean()
+        v10 = df_10[col].mean()
+        vall = df_v[col].mean()
+        return (0.55 * v5) + (0.30 * v10) + (0.15 * vall)
+
+    min_p = pond_col('MIN')
+    pts_p = pond_col('PTS')
+    reb_p = pond_col('REB')
+    ast_p = pond_col('AST')
+
+    # Tasas por minuto ponderadas
+    tasa_pts_5 = df_5['PTS'].sum() / max(df_5['MIN'].sum(), 1.0)
+    tasa_pts_10 = df_10['PTS'].sum() / max(df_10['MIN'].sum(), 1.0)
+    tasa_pts = (0.55 * tasa_pts_5) + (0.45 * tasa_pts_10)
+
+    tasa_reb_5 = df_5['REB'].sum() / max(df_5['MIN'].sum(), 1.0)
+    tasa_reb_10 = df_10['REB'].sum() / max(df_10['MIN'].sum(), 1.0)
+    tasa_reb = (0.55 * tasa_reb_5) + (0.45 * tasa_reb_10)
+
+    tasa_ast_5 = df_5['AST'].sum() / max(df_5['MIN'].sum(), 1.0)
+    tasa_ast_10 = df_10['AST'].sum() / max(df_10['MIN'].sum(), 1.0)
+    tasa_ast = (0.55 * tasa_ast_5) + (0.45 * tasa_ast_10)
+
+    return {
+        'min': round(min_p, 1),
+        'pts': round(pts_p, 1),
+        'reb': round(reb_p, 1),
+        'ast': round(ast_p, 1),
+        'tasa_pts': tasa_pts,
+        'tasa_reb': tasa_reb,
+        'tasa_ast': tasa_ast
+    }
+
+
 def calcular_lineas_automaticas_jugador(df_jugador_previo):
+    """
+    Estima la línea de mercado usando la mediana y media ponderada (evita que un solo partido
+    de 45 puntos infle artificialmente la línea base).
+    """
     if df_jugador_previo is None or df_jugador_previo.empty:
         return {'pts': 15.5, 'reb': 5.5, 'ast': 3.5}
 
@@ -452,22 +504,25 @@ def calcular_lineas_automaticas_jugador(df_jugador_previo):
     if df_v.empty:
         return {'pts': 15.5, 'reb': 5.5, 'ast': 3.5}
 
+    st_pond = calcular_estadisticas_ponderadas_jugador(df_jugador_previo)
     df_10 = df_v.head(10)
-    pts_pond = (0.60 * df_10['PTS'].mean()) + (0.40 * df_v['PTS'].mean())
-    reb_pond = (0.60 * df_10['REB'].mean()) + (0.40 * df_v['REB'].mean())
-    ast_pond = (0.60 * df_10['AST'].mean()) + (0.40 * df_v['AST'].mean())
+
+    # Mezcla 65% media ponderada + 35% mediana reciente (las casas de apuestas usan mediana/moda)
+    pts_ref = (0.65 * st_pond['pts']) + (0.35 * df_10['PTS'].median())
+    reb_ref = (0.65 * st_pond['reb']) + (0.35 * df_10['REB'].median())
+    ast_ref = (0.65 * st_pond['ast']) + (0.35 * df_10['AST'].median())
 
     def a_medio_punto(val):
         return max(np.floor(val) + 0.5, 0.5)
 
     return {
-        'pts': round(a_medio_punto(pts_pond), 1),
-        'reb': round(a_medio_punto(reb_pond), 1),
-        'ast': round(a_medio_punto(ast_pond), 1)
+        'pts': round(a_medio_punto(pts_ref), 1),
+        'reb': round(a_medio_punto(reb_ref), 1),
+        'ast': round(a_medio_punto(ast_ref), 1)
     }
 
 # ==============================================================================
-# 2. CAPA 5: MOTOR DE ALINEACIONES, REDISTRIBUCIÓN DE MINUTOS Y USAGE BUMP
+# 2. CAPA 5 CALIBRADA: SIN DOBLE CONTEO DE LESIONES Y CON ENCOGIMIENTO BAYESIANO
 # ==============================================================================
 
 def normalizar_grupo_posicion(pos_str):
@@ -490,8 +545,22 @@ def calcular_ajustes_rotacion_capa5(
     bajas_evento_nombres=None,
     datos_vivo_partido=None
 ):
+    """
+    Calibración anti-inflación:
+    1. Solo redistribuye minutos de bajas RECIENTES (que jugaron en los últimos 18 días).
+       Si un jugador lleva meses lesionado, su ausencia ya está descontada en los stats actuales.
+    2. Aplica encogimiento del 35% (shrinkage): gran parte de los minutos vacantes los absorben
+       suplentes de rotación profunda, no las estrellas que ya juegan 33+ min.
+    3. Tope estricto de +3.0 minutos extra y multiplicador combinado máximo de 1.10x (+10%).
+    """
     bajas_ev_ids_set = set(str(x) for x in (bajas_evento_ids or []))
     bajas_ev_noms_set = set(bajas_evento_nombres or [])
+
+    try:
+        dt_limite = datetime.strptime(fecha_limite_str, "%Y-%m-%d")
+        fecha_corte_reciente = (dt_limite - timedelta(days=18)).strftime("%Y-%m-%d")
+    except Exception:
+        fecha_corte_reciente = "2000-01-01"
 
     roster_equipo = [
         (nom, inf) for nom, inf in catalogo_jugadores.items()
@@ -505,17 +574,12 @@ def calcular_ajustes_rotacion_capa5(
         id_j = str(inf.get('id', ''))
         status_raw = inf.get('status', 'Active')
 
-        # 1. Revisar si el reporte médico del roster o liga lo da por OUT/Doubtful/Injured
         es_baja_roster = es_estatus_baja(status_raw)
-        # 2. Revisar si el reporte oficial del partido en el scoreboard lo marca OUT
         es_baja_scoreboard = (id_j in bajas_ev_ids_set) or (normalizar_texto(nom) in bajas_ev_noms_set)
-        # 3. Revisar si el partido ya está en vivo (>= Q2 o DNP marcado) y el jugador no está jugando
         es_baja_en_vivo = False
         if datos_vivo_partido and datos_vivo_partido.get("estado") in ("in", "post"):
             j_v = datos_vivo_partido["jugadores_por_id"].get(id_j) or datos_vivo_partido["jugadores_por_nombre"].get(normalizar_texto(nom))
-            if j_v is None:
-                es_baja_en_vivo = True
-            elif j_v.get("dnp", False):
+            if j_v is None or j_v.get("dnp", False):
                 es_baja_en_vivo = True
             elif datos_vivo_partido.get("cuarto", 1) >= 2 and j_v.get("MIN_ACTUAL", 0.0) == 0.0:
                 es_baja_en_vivo = True
@@ -532,12 +596,14 @@ def calcular_ajustes_rotacion_capa5(
         df_j = consultar_gamelog_jugador(id_j)
         if df_j is not None and not df_j.empty:
             df_prev = obtener_historial_previo_sin_leakage(df_j, fecha_limite_str)
-            df_v = df_prev[df_prev['MIN'] > 0].head(10)
+            df_v = df_prev[df_prev['MIN'] > 0]
             if not df_v.empty:
-                min_base = float(df_v['MIN'].mean())
-                tasa_pts = df_v['PTS'].sum() / df_v['MIN'].sum()
-                tasa_ast = df_v['AST'].sum() / df_v['MIN'].sum()
-                usg_est = min(max((tasa_pts * 36.0 + tasa_ast * 14.0), 10.0), 38.0)
+                st_p = calcular_estadisticas_ponderadas_jugador(df_prev)
+                min_base = st_p['min']
+                ultima_fecha_jugada = str(df_v.iloc[0]['FECHA'])
+                es_baja_reciente = (ultima_fecha_jugada >= fecha_corte_reciente) or (nom in bajas_manuales_out)
+
+                usg_est = min(max((st_p['tasa_pts'] * 36.0 + st_p['tasa_ast'] * 14.0), 10.0), 38.0)
                 grupo_pos = normalizar_grupo_posicion(inf.get('position', 'F'))
 
                 registro = {
@@ -547,11 +613,12 @@ def calcular_ajustes_rotacion_capa5(
                     'grupo_pos': grupo_pos,
                     'min_base': min_base,
                     'usg_est': round(usg_est, 1),
-                    'status_raw': status_raw
+                    'status_raw': status_raw,
+                    'es_baja_reciente': es_baja_reciente
                 }
-                if esta_out and min_base >= 10.0:
+                if esta_out and min_base >= 14.0:
                     jugadores_out.append(registro)
-                elif not esta_out and min_base >= 8.0:
+                elif not esta_out and min_base >= 10.0:
                     jugadores_activos.append(registro)
 
     ajustes = {}
@@ -579,11 +646,15 @@ def calcular_ajustes_rotacion_capa5(
             'motivos': ['Jugador descartado / OUT']
         }
 
-    if not jugadores_out or not jugadores_activos:
+    # Filtrar SOLO bajas recientes para redistribuir (evita doble conteo de lesiones viejas)
+    bajas_redistribuibles = [b for b in jugadores_out if b['es_baja_reciente']]
+
+    if not bajas_redistribuibles or not jugadores_activos:
         return ajustes, jugadores_out
 
-    for baja in jugadores_out:
-        min_vacantes = baja['min_base']
+    for baja in bajas_redistribuibles:
+        # Encogimiento del 35%: solo el 35% de los minutos vacantes suben a titulares principales
+        min_vacantes_efectivos = baja['min_base'] * 0.35
         grupo_baja = baja['grupo_pos']
         usg_baja = baja['usg_est']
 
@@ -591,59 +662,46 @@ def calcular_ajustes_rotacion_capa5(
             [j for j in jugadores_activos if j['grupo_pos'] == grupo_baja],
             key=lambda x: x['min_base'],
             reverse=True
-        )
-        adyacentes = sorted(
-            [j for j in jugadores_activos if j['grupo_pos'] != grupo_baja],
-            key=lambda x: x['min_base'],
-            reverse=True
         )[:3]
 
-        bolsa_directa = min_vacantes * 0.65
         if misma_pos:
-            pesos_dir = [0.70] + [0.30 / max(len(misma_pos) - 1, 1)] * (len(misma_pos) - 1) if len(misma_pos) > 1 else [1.0]
+            pesos_dir = [0.55, 0.30, 0.15][:len(misma_pos)]
+            suma_p = sum(pesos_dir)
+            pesos_dir = [p / suma_p for p in pesos_dir]
+
             for idx, cand in enumerate(misma_pos):
                 nom_c = cand['nombre']
-                ganancia = bolsa_directa * pesos_dir[idx]
-                nuevo_min = min(ajustes[nom_c]['min_ajustados'] + ganancia, 39.0)
+                ganancia = min_vacantes_efectivos * pesos_dir[idx]
+                tope_personal = min(cand['min_base'] + 3.0, 36.5)
+                nuevo_min = min(ajustes[nom_c]['min_ajustados'] + ganancia, tope_personal)
                 real_ganado = nuevo_min - ajustes[nom_c]['min_ajustados']
                 ajustes[nom_c]['min_ajustados'] = round(nuevo_min, 1)
                 ajustes[nom_c]['extra_min'] = round(ajustes[nom_c]['extra_min'] + real_ganado, 1)
-                if real_ganado >= 0.5:
+                if real_ganado >= 0.4:
                     ajustes[nom_c]['motivos'].append(f"+{real_ganado:.1f} min por baja de {baja['nombre']}")
 
-        bolsa_adyacente = min_vacantes * 0.35
-        if adyacentes:
-            reparto_ady = bolsa_adyacente / len(adyacentes)
-            for cand in adyacentes:
-                nom_c = cand['nombre']
-                nuevo_min = min(ajustes[nom_c]['min_ajustados'] + reparto_ady, 39.0)
-                real_ganado = nuevo_min - ajustes[nom_c]['min_ajustados']
-                ajustes[nom_c]['min_ajustados'] = round(nuevo_min, 1)
-                ajustes[nom_c]['extra_min'] = round(ajustes[nom_c]['extra_min'] + real_ganado, 1)
-
-        if usg_baja > 25.0:
-            exceso_usg = (usg_baja - 25.0) / 100.0
-            principales = sorted(jugadores_activos, key=lambda x: x['usg_est'], reverse=True)[:4]
+        if usg_baja > 26.0:
+            exceso_usg = (usg_baja - 26.0) / 100.0
+            principales = sorted(jugadores_activos, key=lambda x: x['usg_est'], reverse=True)[:3]
             for cand in principales:
                 nom_c = cand['nombre']
-                bump = 0.04 + (exceso_usg * 0.45)
-                ajustes[nom_c]['factor_usage_bump'] = round(ajustes[nom_c]['factor_usage_bump'] + bump, 3)
-                ajustes[nom_c]['motivos'].append(f"Usage Bump +{bump*100:.1f}% (Baja {baja['nombre']} USG {usg_baja}%)")
+                bump = min(0.02 + (exceso_usg * 0.25), 0.05)
+                ajustes[nom_c]['factor_usage_bump'] = round(min(ajustes[nom_c]['factor_usage_bump'] + bump, 1.07), 3)
+                ajustes[nom_c]['motivos'].append(f"Usage Bump +{bump*100:.1f}% (Baja {baja['nombre']})")
 
     for nom_c, dat in ajustes.items():
         if dat['esta_out']:
             continue
         ratio_min = dat['min_ajustados'] / max(dat['min_base'], 1.0)
         mult_bruto = ratio_min * dat['factor_usage_bump']
-        mult_tope = min(mult_bruto, 1.25)
+        # Cap conservador estricto: máximo +10% combinado para evitar proyecciones infladas
+        mult_tope = min(mult_bruto, 1.10)
         dat['multiplicador_combinado'] = round(mult_tope, 3)
-        if mult_bruto > 1.25:
-            dat['motivos'].append("Cap de conservadurismo aplicado (+25% máx)")
 
     return ajustes, jugadores_out
 
 # ==============================================================================
-# 3. CAPAS 1, 2 Y 3: MOTOR PROBABILÍSTICO CON BACK-TO-BACK Y RIESGO DE PALIZA
+# 3. CAPAS 1, 2 Y 3 CALIBRADAS: VARIANZA REALISTA NBA Y REGRESIÓN A LA MEDIA
 # ==============================================================================
 
 def calcular_contexto_colectivo_capa1(
@@ -689,12 +747,12 @@ def calcular_contexto_colectivo_capa1(
     diferencia_esperada = lambda_t1 - lambda_t2
     spread_abs = abs(diferencia_esperada)
 
-    if spread_abs >= 12.5:
+    if spread_abs >= 12.0:
         riesgo_paliza = "ALTO"
-        factor_recorte_paliza = 0.92
-    elif spread_abs >= 9.0:
+        factor_recorte_paliza = 0.91
+    elif spread_abs >= 8.5:
         riesgo_paliza = "MODERADO"
-        factor_recorte_paliza = 0.96
+        factor_recorte_paliza = 0.95
     else:
         riesgo_paliza = "BAJO"
         factor_recorte_paliza = 1.0
@@ -734,7 +792,7 @@ def aplicar_ajustes_fatiga_y_paliza_minutos(
     min_aj = minutos_base
     etiquetas = []
 
-    if en_b2b and minutos_base >= 26.0:
+    if en_b2b and minutos_base >= 25.0:
         min_aj *= 0.935
         etiquetas.append("B2B (-6.5% min)")
 
@@ -764,20 +822,22 @@ def calcular_proyeccion_jugador_capa2_3(
     if df_valid.empty:
         return None
 
-    min_totales = df_valid['MIN'].sum()
-    if min_totales == 0:
-        return None
-
-    tasa_pts_min = df_valid['PTS'].sum() / min_totales
-    tasa_reb_min = df_valid['REB'].sum() / min_totales
-    tasa_ast_min = df_valid['AST'].sum() / min_totales
-    min_promedio_hist = df_valid['MIN'].mean()
+    st_pond = calcular_estadisticas_ponderadas_jugador(df_jugador)
+    tasa_pts_min = st_pond['tasa_pts']
+    tasa_reb_min = st_pond['tasa_reb']
+    tasa_ast_min = st_pond['tasa_ast']
+    min_promedio_hist = st_pond['min']
 
     pace_liga = promedios_liga.get('pace_liga', 99.5) if promedios_liga else 99.5
     def_liga = promedios_liga.get('def_liga', 114.5) if promedios_liga else 114.5
 
-    factor_ritmo = (posesiones_partido / pace_liga) if posesiones_partido else 1.0
-    factor_rival = (def_rtg_rival / def_liga) if def_rtg_rival else 1.0
+    # Amortiguación de factores externos (50% de sensibilidad para evitar extremos)
+    factor_ritmo_raw = (posesiones_partido / pace_liga) if posesiones_partido else 1.0
+    factor_ritmo = 1.0 + ((factor_ritmo_raw - 1.0) * 0.65)
+
+    factor_rival_raw = (def_rtg_rival / def_liga) if def_rtg_rival else 1.0
+    factor_rival = 1.0 + ((factor_rival_raw - 1.0) * 0.75)
+
     factor_fatiga_eficiencia = 0.975 if en_b2b else 1.0
 
     min_ref = min_base_sin_bajas if min_base_sin_bajas else min_promedio_hist
@@ -786,28 +846,40 @@ def calcular_proyeccion_jugador_capa2_3(
     lambda_ast_sin_bajas = tasa_ast_min * min_ref * factor_ritmo * (1.0 + (factor_rival - 1.0) * 0.5)
 
     lambda_pts_bruto = tasa_pts_min * minutos_proyectados * factor_ritmo * factor_rival * factor_usage_bump * factor_fatiga_eficiencia
-    lambda_reb_bruto = tasa_reb_min * minutos_proyectados * factor_ritmo * (1.0 + (factor_usage_bump - 1.0) * 0.4)
+    lambda_reb_bruto = tasa_reb_min * minutos_proyectados * factor_ritmo * (1.0 + (factor_usage_bump - 1.0) * 0.3)
     lambda_ast_bruto = tasa_ast_min * minutos_proyectados * factor_ritmo * (1.0 + (factor_rival - 1.0) * 0.5) * factor_usage_bump * factor_fatiga_eficiencia
 
-    lambda_pts = min(lambda_pts_bruto, lambda_pts_sin_bajas * 1.25) if factor_usage_bump > 1.0 or minutos_proyectados > min_ref else lambda_pts_bruto
-    lambda_reb = min(lambda_reb_bruto, lambda_reb_sin_bajas * 1.25) if factor_usage_bump > 1.0 or minutos_proyectados > min_ref else lambda_reb_bruto
-    lambda_ast = min(lambda_ast_bruto, lambda_ast_sin_bajas * 1.25) if factor_usage_bump > 1.0 or minutos_proyectados > min_ref else lambda_ast_bruto
+    # Tope máximo del 10% sobre proyección base sin bajas
+    lambda_pts_tope = min(lambda_pts_bruto, lambda_pts_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_pts_bruto
+    lambda_reb_tope = min(lambda_reb_bruto, lambda_reb_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_reb_bruto
+    lambda_ast_tope = min(lambda_ast_bruto, lambda_ast_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_ast_bruto
 
-    std_pts = df_valid['PTS'].std() if len(df_valid) > 1 else 4.5
-    if pd.isna(std_pts) or std_pts == 0:
-        std_pts = 4.5
+    # Regresión a la media (80% modelo + 20% línea evaluada) para calibrar probabilidad real
+    lambda_pts = (0.80 * lambda_pts_tope) + (0.20 * linea_pts)
+    lambda_reb = (0.80 * lambda_reb_tope) + (0.20 * linea_reb)
+    lambda_ast = (0.80 * lambda_ast_tope) + (0.20 * linea_ast)
+
+    # Desviación estándar realista NBA (piso mínimo para no inflar Z-score)
+    std_hist_pts = df_valid['PTS'].std() if len(df_valid) > 1 else 6.0
+    if pd.isna(std_hist_pts):
+        std_hist_pts = 6.0
+    std_pts = max(float(std_hist_pts), lambda_pts * 0.26, 5.2)
 
     z_score = (linea_pts - lambda_pts) / std_pts
     prob_more_pts = (1.0 - norm.cdf(z_score)) * 100.0
+    prob_more_pts = min(max(prob_more_pts, 25.0), 75.0)
     prob_less_pts = 100.0 - prob_more_pts
 
-    limite_poisson_reb = int(np.floor(linea_reb))
-    prob_less_reb = poisson.cdf(limite_poisson_reb, max(lambda_reb, 1e-6)) * 100.0
-    prob_more_reb = 100.0 - prob_less_reb
+    # Para Rebotes y Asistencias usamos distribución Normal con sobredispersión (más realista que Poisson puro)
+    std_reb = max(float(df_valid['REB'].std()) if len(df_valid) > 1 else 2.5, np.sqrt(max(lambda_reb, 1.0)) * 1.25, 2.0)
+    z_reb = (linea_reb - lambda_reb) / std_reb
+    prob_more_reb = min(max((1.0 - norm.cdf(z_reb)) * 100.0, 25.0), 75.0)
+    prob_less_reb = 100.0 - prob_more_reb
 
-    limite_poisson_ast = int(np.floor(linea_ast))
-    prob_less_ast = poisson.cdf(limite_poisson_ast, max(lambda_ast, 1e-6)) * 100.0
-    prob_more_ast = 100.0 - prob_less_ast
+    std_ast = max(float(df_valid['AST'].std()) if len(df_valid) > 1 else 2.2, np.sqrt(max(lambda_ast, 1.0)) * 1.25, 1.8)
+    z_ast = (linea_ast - lambda_ast) / std_ast
+    prob_more_ast = min(max((1.0 - norm.cdf(z_ast)) * 100.0, 25.0), 75.0)
+    prob_less_ast = 100.0 - prob_more_ast
 
     return {
         'min_promedio_hist': round(min_promedio_hist, 1),
@@ -965,7 +1037,7 @@ def calcular_ajuste_vivo_capa4(
     id_jugador_espn,
     nombre_jugador,
     df_historial,
-    minutos_proyectados_totales=34.0,
+    minutos_proyectados_totales=33.0,
     linea_pts=22.5,
     linea_reb=6.5,
     linea_ast=4.5,
@@ -988,17 +1060,13 @@ def calcular_ajuste_vivo_capa4(
     min_reloj = datos_vivo["min_reloj"]
     min_restantes_partido = datos_vivo["min_restantes_partido"]
     
+    st_p = calcular_estadisticas_ponderadas_jugador(df_historial)
+    tasa_pts = st_p['tasa_pts'] * factor_ritmo * factor_rival * factor_usage_bump
+    tasa_reb = st_p['tasa_reb'] * factor_ritmo
+    tasa_ast = st_p['tasa_ast'] * factor_ritmo * factor_usage_bump
+
     df_valid = df_historial[df_historial["MIN"] > 0].head(10)
-    min_hist_total = df_valid["MIN"].sum()
-    if min_hist_total == 0:
-        return None
-        
-    tasa_pts = (df_valid["PTS"].sum() / min_hist_total) * factor_ritmo * factor_rival * factor_usage_bump
-    tasa_reb = (df_valid["REB"].sum() / min_hist_total) * factor_ritmo
-    tasa_ast = (df_valid["AST"].sum() / min_hist_total) * factor_ritmo * factor_usage_bump
-    std_pts_hist = df_valid["PTS"].std() if len(df_valid) > 1 else 4.5
-    if pd.isna(std_pts_hist) or std_pts_hist == 0:
-        std_pts_hist = 4.5
+    std_pts_hist = max(float(df_valid["PTS"].std()) if len(df_valid) > 1 else 6.0, 5.2)
 
     ratio_rotacion = min(minutos_proyectados_totales / 48.0, 1.0)
     min_restantes_jugador = min(min_restantes_partido * ratio_rotacion, min_restantes_partido)
@@ -1082,7 +1150,7 @@ def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
     p1 = round(p1, 1)
 
     badge_ganador = ""
-    if max(p1, p2) >= UMBRAL_ALTA_CONFIANZA:
+    if max(p1, p2) >= 62.0:
         fav = abrev_t1 if p1 >= p2 else abrev_t2
         badge_ganador = f' <span class="badge-high-conf">🔥 ALTA CONFIANZA ({fav} {max(p1, p2):.1f}%)</span>'
 
@@ -1110,7 +1178,7 @@ def obtener_html_badge_confianza(prob_rec):
 # ==============================================================================
 
 st.title("🏀 NBA Real-Time Analytics & Backtesting Engine")
-st.markdown("Motor Probabilístico Autónomo (Capas 1 a 5): Líneas Automáticas, Alta Confianza (≥62%), B2B, Palizas y Usage Bump.")
+st.markdown(f"Motor Probabilístico Calibrado (Capas 1 a 5): Ponderación Reciente, Regresión Bayesiana, Alta Confianza (≥{UMBRAL_ALTA_CONFIANZA}%) y Marcadores en Vivo.")
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
@@ -1183,10 +1251,10 @@ altas_manuales_in = st.sidebar.multiselect(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 Filtros, Fatiga y Automatización")
-solo_alta_confianza = st.sidebar.checkbox("🔥 Filtrar solo Alta Confianza (≥62%) en tablas", value=False)
+solo_alta_confianza = st.sidebar.checkbox(f"🔥 Filtrar solo Alta Confianza (≥{UMBRAL_ALTA_CONFIANZA}%) en tablas", value=False)
 aplicar_b2b_y_paliza = st.sidebar.checkbox("Ajuste Automático Back-to-Back y Palizas", value=True)
 usar_min_automaticos = st.sidebar.checkbox("Usar Minutos Ajustados Automáticos", value=True)
-min_proj_manual = st.sidebar.slider("Minutos Manuales (si desactivas auto)", min_value=15.0, max_value=42.0, value=34.0, step=0.5)
+min_proj_manual = st.sidebar.slider("Minutos Manuales (si desactivas auto)", min_value=15.0, max_value=42.0, value=32.0, step=0.5)
 modo_vivo = st.sidebar.toggle("Activar Polling en Vivo cada 30s", value=True)
 
 with st.sidebar.expander("🛠️ Sobreescribir Líneas del Jugador (Opcional)"):
@@ -1229,10 +1297,6 @@ def obtener_ajustes_equipo_cached(team_id, bajas_ev_ids=None, bajas_ev_noms=None
 
 
 def hallar_top_jugadores_activos(lista_jugadores, ajustes_equipo, top_n=2):
-    """
-    Devuelve hasta top_n figuras SANAS y ACTIVAS del equipo ordenadas por jerarquía,
-    descartando estrictamente a cualquier jugador lesionado o marcado OUT.
-    """
     candidatos = []
     for nom, inf in lista_jugadores[:25]:
         aj = ajustes_equipo.get(nom, {})
@@ -1247,10 +1311,11 @@ def hallar_top_jugadores_activos(lista_jugadores, ajustes_equipo, top_n=2):
             df_v = df_prev[df_prev['MIN'] > 0].head(10)
             if df_v.empty:
                 continue
-            min_prom = df_v['MIN'].mean()
-            pts_prom = df_v['PTS'].mean()
-            reb_prom = df_v['REB'].mean()
-            ast_prom = df_v['AST'].mean()
+            st_p = calcular_estadisticas_ponderadas_jugador(df_prev)
+            min_prom = st_p['min']
+            pts_prom = st_p['pts']
+            reb_prom = st_p['reb']
+            ast_prom = st_p['ast']
            
             if min_prom >= 18.0:
                 score_jerarquia = pts_prom * 1.25 + reb_prom + ast_prom
@@ -1281,7 +1346,6 @@ if cartelera_fecha:
             partido_en_vivo = partido['estado_codigo'] == 'in'
             partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
 
-            # Si el partido está en vivo o finalizado, traemos boxscore para estadísticas reales al instante
             datos_vivo_p = obtener_datos_en_vivo_espn(partido['event_id']) if (partido_en_vivo or partido_finalizado) else None
 
             t1_b2b = (str(t1_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
@@ -1367,11 +1431,10 @@ if cartelera_fecha:
                     )
                     lambda_pts = proy['lambda_pts'] if proy else pts_j
                     prob_more = proy['prob_more_pts'] if proy else 50.0
-                    rec_pts = "MÁS" if prob_more > 50 else "MENOS"
+                    rec_pts = "MÁS" if prob_more >= 50.0 else "MENOS"
                     prob_rec = max(prob_more, 100.0 - prob_more)
                     es_alta_conf = prob_rec >= UMBRAL_ALTA_CONFIANZA
 
-                    # Evaluar estado real (Finalizado, En Vivo o Pendiente)
                     pts_real_str = "-"
                     reb_real_str = "-"
                     ast_real_str = "-"
@@ -1435,7 +1498,6 @@ if cartelera_fecha:
            
             col_p1, col_p2 = st.columns(2)
            
-            # Mostrar Tarjeta Estrella Principal Equipo 1
             with col_p1:
                 if top_t1:
                     nom_1, pts_1, reb_1, ast_1, min_1, stat_1, id_1, df_j1_full, df_j1_prev = top_t1[0]
@@ -1472,7 +1534,6 @@ if cartelera_fecha:
                 else:
                     st.info(f"Sin jugadores sanos activos para {partido['abrev_t1']}")
 
-            # Mostrar Tarjeta Estrella Principal Equipo 2
             with col_p2:
                 if top_t2:
                     nom_2, pts_2, reb_2, ast_2, min_2, stat_2, id_2, df_j2_full, df_j2_prev = top_t2[0]
@@ -1509,7 +1570,6 @@ if cartelera_fecha:
                 else:
                     st.info(f"Sin jugadores sanos activos para {partido['abrev_t2']}")
            
-            # Resultados colectivos basados en Capa 1 + Línea O/U Automática + B2B
             prob_t1 = ctx_partido['prob_t1']
             prob_t2 = ctx_partido['prob_t2']
             total_proyectado_partido = ctx_partido['total_proyectado']
@@ -1518,7 +1578,7 @@ if cartelera_fecha:
             prob_total_rec = ctx_partido['prob_over_total'] if is_more_partido else (100.0 - ctx_partido['prob_over_total'])
             ganador_recomendado = partido['abrev_t1'] if prob_t1 >= prob_t2 else partido['abrev_t2']
             max_prob_val = max(prob_t1, prob_t2)
-            es_alta_conf_eq = max_prob_val >= UMBRAL_ALTA_CONFIANZA or prob_total_rec >= UMBRAL_ALTA_CONFIANZA
+            es_alta_conf_eq = max_prob_val >= 62.0 or prob_total_rec >= 62.0
 
             s1 = partido['score_t1']
             s2 = partido['score_t2']
@@ -1578,10 +1638,10 @@ if cartelera_fecha:
 
                 col_r1, col_r2 = st.columns(2)
                 with col_r1:
-                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= UMBRAL_ALTA_CONFIANZA else ""
+                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= 62.0 else ""
                     st.success(f"🏆 **Ganador Recomendado:** **{ganador_recomendado}** ({max_prob_val:.1f}%){sello_ml} | Vivo: **{estado_ganador_vivo}**")
                 with col_r2:
-                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= UMBRAL_ALTA_CONFIANZA else ""
+                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= 62.0 else ""
                     st.warning(
                         f"📈 **Total Partido (Línea {linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → "
                         f"**{verdict_partido_total} ({prob_total_rec:.1f}%)**{sello_ou} | Acumulado: **{total_actual} pts**"
@@ -1606,10 +1666,10 @@ if cartelera_fecha:
 
                 col_r1, col_r2 = st.columns(2)
                 with col_r1:
-                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= UMBRAL_ALTA_CONFIANZA else ""
+                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= 62.0 else ""
                     st.success(f"🏆 **Ganador Recomendado (Moneyline):** **{ganador_recomendado}** ({max_prob_val:.1f}%){sello_ml}")
                 with col_r2:
-                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= UMBRAL_ALTA_CONFIANZA else ""
+                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= 62.0 else ""
                     st.warning(
                         f"📈 **Total Partido (Línea {linea_ou_partido} - {origen_ou_partido}):** "
                         f"Proyección {total_proyectado_partido:.1f} pts → **RECOMENDACIÓN: {verdict_partido_total} ({prob_total_rec:.1f}%)**{sello_ou}"
@@ -1626,11 +1686,11 @@ else:
 
 if resumen_equipos:
     st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos y Marcadores en Vivo")
-    st.markdown("Tabla sincronizada en tiempo real con **marcadores en vivo (`🔴`)**, totales acumulados, líneas O/U e insignia **🔥 ALTA CONFIANZA (≥62%)**.")
+    st.markdown("Tabla sincronizada en tiempo real con **marcadores en vivo (`🔴`)**, totales acumulados, líneas O/U e insignia **🔥 ALTA CONFIANZA**.")
    
     df_equipos = pd.DataFrame(resumen_equipos)
     if solo_alta_confianza:
-        df_equipos = df_equipos[df_equipos['Prob_Max_Num'] >= UMBRAL_ALTA_CONFIANZA]
+        df_equipos = df_equipos[df_equipos['Prob_Max_Num'] >= 62.0]
 
     df_equipos_export = df_equipos.drop(columns=['Prob_Max_Num'], errors='ignore').copy()
     if not df_equipos_export.empty:
@@ -1644,12 +1704,12 @@ if resumen_equipos:
         df_equipos_export['Prob. Victoria'] = df_equipos_export['Prob. Victoria'].apply(lambda x: f"{x:.1f}%")
         st.dataframe(df_equipos_export, use_container_width=True, hide_index=True)
     else:
-        st.info("Ningún encuentro supera el umbral de Alta Confianza (≥62%) en esta jornada.")
+        st.info("Ningún encuentro supera el umbral de Alta Confianza en esta jornada.")
     st.markdown("---")
 
 if resumen_jugadores:
     st.subheader("⭐ Resumen Ejecutivo: Figuras Sanas Activas y Progreso en Vivo")
-    st.markdown("Incluye el **Top 2 de jugadores sanos por equipo** (excluyendo lesionados/OUT), su **progreso actual en vivo**, minutos y proyecciones de PTS/REB/AST.")
+    st.markdown(f"Calibrado con **ponderación reciente (55% L5)** y **regresión bayesiana** (Alta Confianza ≥{UMBRAL_ALTA_CONFIANZA}%).")
    
     df_jugadores_res = pd.DataFrame(resumen_jugadores)
     if solo_alta_confianza:
@@ -1666,7 +1726,7 @@ if resumen_jugadores:
         )
         st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True)
     else:
-        st.info("Ningún jugador activo supera el umbral de Alta Confianza (≥62%) en esta jornada.")
+        st.info(f"Ningún jugador activo supera el umbral de Alta Confianza (≥{UMBRAL_ALTA_CONFIANZA}%) en esta jornada.")
     st.markdown("---")
 
 # ==============================================================================
@@ -1755,8 +1815,8 @@ if jugador_activo:
             factor_paliza_jugador = ctx_j['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
             riesgo_paliza_txt = ctx_j['riesgo_paliza']
 
-        df_valid_min = df_jugador_previo[df_jugador_previo['MIN'] > 0].head(10)
-        min_auto_sin_bajas = float(df_valid_min['MIN'].mean()) if not df_valid_min.empty else min_proj_manual
+        st_pond_j = calcular_estadisticas_ponderadas_jugador(df_jugador_previo)
+        min_auto_sin_bajas = st_pond_j['min']
         min_auto_con_bajas = ajuste_indiv_capa5.get('min_ajustados', min_auto_sin_bajas) if not ajuste_indiv_capa5.get('esta_out', False) else 0.0
         min_auto_con_fatiga, notas_fatiga_j = aplicar_ajustes_fatiga_y_paliza_minutos(
             min_auto_con_bajas, en_b2b=en_b2b_jugador, factor_recorte_paliza=factor_paliza_jugador
@@ -1859,17 +1919,17 @@ if jugador_activo:
             lambda_pts = proy_detallada['lambda_pts']
             prob_more_pts = proy_detallada['prob_more_pts']
             prob_less_pts = proy_detallada['prob_less_pts']
-            rec_pts_hist = "MÁS" if prob_more_pts > 50 else "MENOS"
+            rec_pts_hist = "MÁS" if prob_more_pts >= 50.0 else "MENOS"
 
             lambda_reb = proy_detallada['lambda_reb']
             prob_more_reb = proy_detallada['prob_more_reb']
             prob_less_reb = proy_detallada['prob_less_reb']
-            rec_reb_hist = "MÁS" if prob_more_reb > 50 else "MENOS"
+            rec_reb_hist = "MÁS" if prob_more_reb >= 50.0 else "MENOS"
 
             lambda_ast = proy_detallada['lambda_ast']
             prob_more_ast = proy_detallada['prob_more_ast']
             prob_less_ast = proy_detallada['prob_less_ast']
-            rec_ast_hist = "MÁS" if prob_more_ast > 50 else "MENOS"
+            rec_ast_hist = "MÁS" if prob_more_ast >= 50.0 else "MENOS"
 
             partido_en_fecha = df_jugador_full[df_jugador_full['FECHA'] == fecha_busqueda_str]
 
@@ -1934,7 +1994,7 @@ if jugador_activo:
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                is_more_pts = prob_more_pts > 50
+                is_more_pts = prob_more_pts >= 50.0
                 prob_rec_p = max(prob_more_pts, prob_less_pts)
                 extra_glow_p = " card-high-conf" if prob_rec_p >= UMBRAL_ALTA_CONFIANZA else ""
                 css_box_p = ("card-over" if is_more_pts else "card-under") + extra_glow_p
@@ -1945,7 +2005,7 @@ if jugador_activo:
                         {badge_p}
                         <h4 style="margin:0; color:white;">🏀 PUNTOS (Línea {origen_lineas_j}: {linea_pts_eval})</h4>
                         <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proyectado: {lambda_pts:.2f} pts</p>
-                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Base: {proy_detallada['tasa_pts_min']:.2f} pts/min</p>
+                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Ponderada: {proy_detallada['tasa_pts_min']:.2f} pts/min</p>
                         <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">{verdict_pts}</p>
                         <p style="margin:0; font-size:12px; color:#cbd5e1;">Más: {prob_more_pts:.1f}% | Menos: {prob_less_pts:.1f}%</p>
                     </div>
@@ -1953,7 +2013,7 @@ if jugador_activo:
                 st.progress(min(max(int(prob_more_pts), 0), 100))
 
             with col2:
-                is_more_reb = prob_more_reb > 50
+                is_more_reb = prob_more_reb >= 50.0
                 prob_rec_r = max(prob_more_reb, prob_less_reb)
                 extra_glow_r = " card-high-conf" if prob_rec_r >= UMBRAL_ALTA_CONFIANZA else ""
                 css_box_r = ("card-over" if is_more_reb else "card-under") + extra_glow_r
@@ -1964,7 +2024,7 @@ if jugador_activo:
                         {badge_r}
                         <h4 style="margin:0; color:white;">📊 REBOTES (Línea {origen_lineas_j}: {linea_reb_eval})</h4>
                         <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proyectado: {lambda_reb:.2f} reb</p>
-                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Base: {proy_detallada['tasa_reb_min']:.2f} reb/min</p>
+                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Ponderada: {proy_detallada['tasa_reb_min']:.2f} reb/min</p>
                         <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">{verdict_reb}</p>
                         <p style="margin:0; font-size:12px; color:#cbd5e1;">Más: {prob_more_reb:.1f}% | Menos: {prob_less_reb:.1f}%</p>
                     </div>
@@ -1972,7 +2032,7 @@ if jugador_activo:
                 st.progress(min(max(int(prob_more_reb), 0), 100))
 
             with col3:
-                is_more_ast = prob_more_ast > 50
+                is_more_ast = prob_more_ast >= 50.0
                 prob_rec_a = max(prob_more_ast, prob_less_ast)
                 extra_glow_a = " card-high-conf" if prob_rec_a >= UMBRAL_ALTA_CONFIANZA else ""
                 css_box_a = ("card-over" if is_more_ast else "card-under") + extra_glow_a
@@ -1983,7 +2043,7 @@ if jugador_activo:
                         {badge_a}
                         <h4 style="margin:0; color:white;">🎯 ASISTENCIAS (Línea {origen_lineas_j}: {linea_ast_eval})</h4>
                         <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proyectado: {lambda_ast:.2f} ast</p>
-                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Base: {proy_detallada['tasa_ast_min']:.2f} ast/min</p>
+                        <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Tasa Ponderada: {proy_detallada['tasa_ast_min']:.2f} ast/min</p>
                         <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">{verdict_ast}</p>
                         <p style="margin:0; font-size:12px; color:#cbd5e1;">Más: {prob_more_ast:.1f}% | Menos: {prob_less_ast:.1f}%</p>
                     </div>
