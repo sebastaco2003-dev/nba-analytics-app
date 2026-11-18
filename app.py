@@ -127,20 +127,32 @@ st.markdown("""
 
 UMBRAL_ALTA_CONFIANZA = 62.0
 
+# Palabras clave que descalifican automáticamente a un jugador de ser recomendado
+ESTATUS_NO_DISPONIBLE = [
+    'out', 'injured', 'injury', 'doubtful', 'suspension', 'suspended',
+    'inactive', 'g-league', 'g league', 'not with team', 'personal', 'rest'
+]
+
 
 def normalizar_texto(texto):
-    """Elimina acentos y pasa a minúsculas para comparar nombres de jugadores sin fallos."""
     if not texto:
         return ""
     nfkd = unicodedata.normalize('NFKD', str(texto))
     return "".join(c for c in nfkd if not unicodedata.combining(c)).strip().lower()
 
 
+def es_estatus_baja(status_str):
+    if not status_str:
+        return False
+    s = str(status_str).strip().lower()
+    return any(palabra in s for palabra in ESTATUS_NO_DISPONIBLE)
+
+
 # ==============================================================================
-# 1. EXTRACCIÓN DE DATOS BASE (CARTELERA, BACK-TO-BACK, ROSTERS Y RATINGS)
+# 1. EXTRACCIÓN DE DATOS BASE (CARTELERA, REPORTES MÉDICOS, B2B Y ROSTERS)
 # ==============================================================================
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=90)
 def obtener_cartelera_por_fecha(fecha_str):
     url_scoreboard = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={fecha_str}"
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -172,7 +184,23 @@ def obtener_cartelera_por_fecha(fecha_str):
                     except (ValueError, TypeError):
                         linea_mercado_ou = None
 
-            status_type = evento.get('status', {}).get('type', {})
+            # Extraer reporte de lesiones oficial del partido (injuries en competitions)
+            bajas_evento_ids = set()
+            bajas_evento_nombres = set()
+            for grp_inj in competitions.get('injuries', []):
+                for inj_item in grp_inj.get('injuries', []):
+                    st_inj = str(inj_item.get('status', '')).lower()
+                    atl_inj = inj_item.get('athlete', {})
+                    id_inj = str(atl_inj.get('id', ''))
+                    nom_inj = atl_inj.get('displayName') or atl_inj.get('fullName', '')
+                    if es_estatus_baja(st_inj):
+                        if id_inj:
+                            bajas_evento_ids.add(id_inj)
+                        if nom_inj:
+                            bajas_evento_nombres.add(normalizar_texto(nom_inj))
+
+            status_obj = evento.get('status', {})
+            status_type = status_obj.get('type', {})
             estado_desc = status_type.get('shortDetail') or status_type.get('description', 'Programado')
            
             if len(competidores) == 2:
@@ -200,7 +228,10 @@ def obtener_cartelera_por_fecha(fecha_str):
                     'detalle': f"{t1.get('team', {}).get('displayName')} vs {t2.get('team', {}).get('displayName')}",
                     'estado': estado_desc,
                     'estado_codigo': status_type.get('state', 'pre'),
-                    'linea_mercado_ou': linea_mercado_ou
+                    'cuarto': int(status_obj.get('period', 0)),
+                    'linea_mercado_ou': linea_mercado_ou,
+                    'bajas_evento_ids': list(bajas_evento_ids),
+                    'bajas_evento_nombres': list(bajas_evento_nombres)
                 })
        
         partidos = sorted(partidos, key=lambda x: x['dt_orden'])
@@ -208,6 +239,26 @@ def obtener_cartelera_por_fecha(fecha_str):
         print(f"Error cartelera fecha {fecha_str}: {e}")
        
     return partidos
+
+
+@st.cache_data(ttl=1800)
+def obtener_reporte_lesiones_liga():
+    """Consulta el endpoint global de lesiones NBA de ESPN para detectar bajas de última hora."""
+    url_inj = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    bajas_globales = {}  # id_espn -> status
+    try:
+        res = requests.get(url_inj, headers=headers, timeout=8).json()
+        for eq_block in res.get('injuries', []):
+            for item in eq_block.get('injuries', []):
+                status_txt = item.get('status', '')
+                atl = item.get('athlete', {})
+                id_atl = str(atl.get('id', ''))
+                if id_atl and status_txt:
+                    bajas_globales[id_atl] = status_txt
+    except Exception as e:
+        print(f"Error reporte lesiones liga: {e}")
+    return bajas_globales
 
 
 def detectar_equipos_back_to_back(fecha_dt):
@@ -295,11 +346,12 @@ def obtener_metricas_avanzadas_equipos():
     return metricas, {'pace_liga': pace_liga, 'off_liga': off_liga, 'def_liga': def_liga}
 
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=3600)
 def obtener_mapa_jugadores_completo():
     url_equipos = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams?limit=50"
     headers = {'User-Agent': 'Mozilla/5.0'}
     mapa_jugadores = {}
+    lesiones_liga = obtener_reporte_lesiones_liga()
    
     try:
         res_eq = requests.get(url_equipos, headers=headers, timeout=10).json()
@@ -314,9 +366,17 @@ def obtener_mapa_jugadores_completo():
             for atleta in res_roster.get('athletes', []):
                 nombre_completo = atleta.get('fullName', '')
                 id_atleta = str(atleta.get('id', ''))
-                status_info = atleta.get('status', {}).get('name', 'Active')
-                if not status_info:
-                    status_info = 'Active'
+                status_roster = atleta.get('status', {}).get('name', 'Active') or 'Active'
+                
+                # Cruzar también con el reporte de lesiones oficial de la liga
+                status_lesion_global = lesiones_liga.get(id_atleta, '')
+                if status_lesion_global and es_estatus_baja(status_lesion_global):
+                    status_final = f"Out ({status_lesion_global})"
+                elif status_lesion_global and status_roster.lower() == 'active':
+                    status_final = status_lesion_global
+                else:
+                    status_final = status_roster
+
                 pos_abrev = atleta.get('position', {}).get('abbreviation', 'F')
                
                 if nombre_completo and id_atleta:
@@ -325,7 +385,7 @@ def obtener_mapa_jugadores_completo():
                         'team_id': id_equipo,
                         'team_abbrev': abrev_equipo,
                         'team_name': nombre_equipo,
-                        'status': status_info,
+                        'status': status_final,
                         'position': pos_abrev
                     }
     except Exception as e:
@@ -425,8 +485,14 @@ def calcular_ajustes_rotacion_capa5(
     bajas_manuales_out,
     altas_manuales_in,
     fecha_limite_str,
-    incluir_bajas_automaticas_espn=True
+    incluir_bajas_automaticas_espn=True,
+    bajas_evento_ids=None,
+    bajas_evento_nombres=None,
+    datos_vivo_partido=None
 ):
+    bajas_ev_ids_set = set(str(x) for x in (bajas_evento_ids or []))
+    bajas_ev_noms_set = set(bajas_evento_nombres or [])
+
     roster_equipo = [
         (nom, inf) for nom, inf in catalogo_jugadores.items()
         if str(inf.get('team_id')) == str(team_id)
@@ -436,19 +502,34 @@ def calcular_ajustes_rotacion_capa5(
     jugadores_out = []
 
     for nom, inf in roster_equipo:
-        status_lower = inf.get('status', 'Active').lower()
-        es_baja_espn = incluir_bajas_automaticas_espn and any(
-            w in status_lower for w in ['out', 'injured', 'suspension', 'inactive']
-        )
+        id_j = str(inf.get('id', ''))
+        status_raw = inf.get('status', 'Active')
+
+        # 1. Revisar si el reporte médico del roster o liga lo da por OUT/Doubtful/Injured
+        es_baja_roster = es_estatus_baja(status_raw)
+        # 2. Revisar si el reporte oficial del partido en el scoreboard lo marca OUT
+        es_baja_scoreboard = (id_j in bajas_ev_ids_set) or (normalizar_texto(nom) in bajas_ev_noms_set)
+        # 3. Revisar si el partido ya está en vivo (>= Q2 o DNP marcado) y el jugador no está jugando
+        es_baja_en_vivo = False
+        if datos_vivo_partido and datos_vivo_partido.get("estado") in ("in", "post"):
+            j_v = datos_vivo_partido["jugadores_por_id"].get(id_j) or datos_vivo_partido["jugadores_por_nombre"].get(normalizar_texto(nom))
+            if j_v is None:
+                es_baja_en_vivo = True
+            elif j_v.get("dnp", False):
+                es_baja_en_vivo = True
+            elif datos_vivo_partido.get("cuarto", 1) >= 2 and j_v.get("MIN_ACTUAL", 0.0) == 0.0:
+                es_baja_en_vivo = True
+
+        es_baja_detectada = incluir_bajas_automaticas_espn and (es_baja_roster or es_baja_scoreboard or es_baja_en_vivo)
 
         if nom in bajas_manuales_out:
             esta_out = True
         elif nom in altas_manuales_in:
             esta_out = False
         else:
-            esta_out = es_baja_espn
+            esta_out = es_baja_detectada
 
-        df_j = consultar_gamelog_jugador(inf['id'])
+        df_j = consultar_gamelog_jugador(id_j)
         if df_j is not None and not df_j.empty:
             df_prev = obtener_historial_previo_sin_leakage(df_j, fecha_limite_str)
             df_v = df_prev[df_prev['MIN'] > 0].head(10)
@@ -461,14 +542,14 @@ def calcular_ajustes_rotacion_capa5(
 
                 registro = {
                     'nombre': nom,
-                    'id': inf['id'],
+                    'id': id_j,
                     'pos': inf.get('position', 'F'),
                     'grupo_pos': grupo_pos,
                     'min_base': min_base,
                     'usg_est': round(usg_est, 1),
-                    'status_raw': inf.get('status', 'Active')
+                    'status_raw': status_raw
                 }
-                if esta_out and min_base >= 12.0:
+                if esta_out and min_base >= 10.0:
                     jugadores_out.append(registro)
                 elif not esta_out and min_base >= 8.0:
                     jugadores_activos.append(registro)
@@ -495,7 +576,7 @@ def calcular_ajustes_rotacion_capa5(
             'factor_usage_bump': 0.0,
             'multiplicador_combinado': 0.0,
             'usg_est': j_out['usg_est'],
-            'motivos': ['Jugador marcado como OUT']
+            'motivos': ['Jugador descartado / OUT']
         }
 
     if not jugadores_out or not jugadores_activos:
@@ -749,7 +830,7 @@ def calcular_proyeccion_jugador_capa2_3(
     }
 
 # ==============================================================================
-# 4. CAPA 4: EXTRACCIÓN Y MOTOR PROBABILÍSTICO EN VIVO (CORREGIDO ID + NOMBRE)
+# 4. CAPA 4: EXTRACCIÓN Y MOTOR PROBABILÍSTICO EN VIVO (BOXSCORE OFICIAL)
 # ==============================================================================
 
 def parsear_reloj_a_minutos(reloj_str):
@@ -765,7 +846,6 @@ def parsear_reloj_a_minutos(reloj_str):
 
 
 def parsear_minutos_jugados_boxscore(val_min):
-    """Soporta tanto '24' como '24:35' en el boxscore en vivo."""
     if not val_min:
         return 0.0
     s = str(val_min).strip()
@@ -778,6 +858,7 @@ def parsear_minutos_jugados_boxscore(val_min):
         return 0.0
 
 
+@st.cache_data(ttl=25)
 def obtener_datos_en_vivo_espn(event_id):
     if not event_id:
         return None
@@ -846,7 +927,6 @@ def obtener_datos_en_vivo_espn(event_id):
                             "FALTAS": int(mapa_s.get("PF", 0)) if str(mapa_s.get("PF", "0")).isdigit() else 0,
                         }
                     else:
-                        # Jugador en banca que aún no entra a la cancha (0 min)
                         registro_vivo = {
                             "id": id_atl,
                             "nombre": nombre,
@@ -898,7 +978,6 @@ def calcular_ajuste_vivo_capa4(
     if not datos_vivo:
         return None
 
-    # Búsqueda robusta: primero por ID exacto de ESPN, luego por nombre normalizado sin acentos
     j_vivo = datos_vivo["jugadores_por_id"].get(str(id_jugador_espn))
     if not j_vivo:
         j_vivo = datos_vivo["jugadores_por_nombre"].get(normalizar_texto(nombre_jugador))
@@ -1050,7 +1129,7 @@ fecha_seleccionada = st.sidebar.date_input("Seleccionar Fecha de Cartelera", val
 fecha_str_api = fecha_seleccionada.strftime("%Y%m%d")
 fecha_busqueda_str = fecha_seleccionada.strftime("%Y-%m-%d")
 
-with st.spinner(f"Sincronizando cartelera, fatiga Back-to-Back, rosters y ratings para el {fecha_seleccionada}..."):
+with st.spinner(f"Sincronizando cartelera, reportes médicos, fatiga B2B y ratings para el {fecha_seleccionada}..."):
     cartelera_fecha = obtener_cartelera_por_fecha(fecha_str_api)
     equipos_b2b_hoy = detectar_equipos_back_to_back(fecha_seleccionada)
     catalogo_jugadores = obtener_mapa_jugadores_completo()
@@ -1069,12 +1148,12 @@ if jugador_seleccionado != "-- Selecciona un jugador --":
     status_actual = info_sel.get('status', 'Active')
     status_lower = status_actual.lower()
 
-    if any(word in status_lower for word in ['active', 'available', 'healthy', 'disponible']):
-        st.sidebar.markdown(f'<div class="status-active">✅ <b>Estatus:</b> {status_actual} (Disponible)</div>', unsafe_allow_html=True)
+    if es_estatus_baja(status_lower):
+        st.sidebar.markdown(f'<div class="status-injured">❌ <b>Estatus:</b> {status_actual} (Lesionado / Fuera)</div>', unsafe_allow_html=True)
     elif any(word in status_lower for word in ['questionable', 'duda', 'day-to-day', 'probable']):
         st.sidebar.markdown(f'<div class="status-questionable">⚠️ <b>Estatus:</b> {status_actual} (En Duda)</div>', unsafe_allow_html=True)
     else:
-        st.sidebar.markdown(f'<div class="status-injured">❌ <b>Estatus:</b> {status_actual} (Lesionado / Fuera)</div>', unsafe_allow_html=True)
+        st.sidebar.markdown(f'<div class="status-active">✅ <b>Estatus:</b> {status_actual} (Disponible)</div>', unsafe_allow_html=True)
 
 # --- CAPA 5: CONTROLES MANUALES OUT / IN EN EL SIDEBAR ---
 st.sidebar.markdown("---")
@@ -1131,7 +1210,8 @@ resumen_equipos = []
 resumen_jugadores = []
 cache_ajustes_equipos = {}
 
-def obtener_ajustes_equipo_cached(team_id):
+
+def obtener_ajustes_equipo_cached(team_id, bajas_ev_ids=None, bajas_ev_noms=None, datos_vivo=None):
     tid = str(team_id)
     if tid not in cache_ajustes_equipos:
         cache_ajustes_equipos[tid] = calcular_ajustes_rotacion_capa5(
@@ -1140,18 +1220,27 @@ def obtener_ajustes_equipo_cached(team_id):
             bajas_manuales_out=bajas_manuales_out,
             altas_manuales_in=altas_manuales_in,
             fecha_limite_str=fecha_busqueda_str,
-            incluir_bajas_automaticas_espn=incluir_bajas_espn
+            incluir_bajas_automaticas_espn=incluir_bajas_espn,
+            bajas_evento_ids=bajas_ev_ids,
+            bajas_evento_nombres=bajas_ev_noms,
+            datos_vivo_partido=datos_vivo
         )
     return cache_ajustes_equipos[tid]
 
 
-def hallar_estrella_activa_real(lista_jugadores, ajustes_equipo):
-    mejor_candidato = None
-    score_maximo = -1
-    for nom, inf in lista_jugadores[:22]:
+def hallar_top_jugadores_activos(lista_jugadores, ajustes_equipo, top_n=2):
+    """
+    Devuelve hasta top_n figuras SANAS y ACTIVAS del equipo ordenadas por jerarquía,
+    descartando estrictamente a cualquier jugador lesionado o marcado OUT.
+    """
+    candidatos = []
+    for nom, inf in lista_jugadores[:25]:
         aj = ajustes_equipo.get(nom, {})
         if aj.get('esta_out', False):
             continue
+        if es_estatus_baja(inf.get('status', 'Active')) and nom not in altas_manuales_in:
+            continue
+
         df_t = consultar_gamelog_jugador(inf['id'])
         if df_t is not None and len(df_t) >= 3:
             df_prev = obtener_historial_previo_sin_leakage(df_t, fecha_busqueda_str)
@@ -1163,21 +1252,15 @@ def hallar_estrella_activa_real(lista_jugadores, ajustes_equipo):
             reb_prom = df_v['REB'].mean()
             ast_prom = df_v['AST'].mean()
            
-            if min_prom >= 22.0:
-                score_jerarquia = pts_prom * 1.2 + reb_prom + ast_prom
-                if score_jerarquia > score_maximo:
-                    score_maximo = score_jerarquia
-                    mejor_candidato = (nom, pts_prom, reb_prom, ast_prom, min_prom, inf.get('status', 'Active'), inf['id'], df_t, df_prev)
-    if not mejor_candidato and lista_jugadores:
-        for nom, inf in lista_jugadores[:8]:
-            if ajustes_equipo.get(nom, {}).get('esta_out', False):
-                continue
-            df_t = consultar_gamelog_jugador(inf['id'])
-            if df_t is not None and not df_t.empty:
-                df_prev = obtener_historial_previo_sin_leakage(df_t, fecha_busqueda_str)
-                if df_prev['MIN'].mean() > 10.0:
-                    return (nom, df_prev['PTS'].mean(), df_prev['REB'].mean(), df_prev['AST'].mean(), df_prev['MIN'].mean(), inf.get('status', 'Active'), inf['id'], df_t, df_prev)
-    return mejor_candidato
+            if min_prom >= 18.0:
+                score_jerarquia = pts_prom * 1.25 + reb_prom + ast_prom
+                candidatos.append((
+                    score_jerarquia,
+                    (nom, pts_prom, reb_prom, ast_prom, min_prom, inf.get('status', 'Active'), str(inf['id']), df_t, df_prev)
+                ))
+
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in candidatos[:top_n]]
 
 
 def evaluar_resultado_linea(valor_real, linea_evaluada, recomendacion_str):
@@ -1195,6 +1278,12 @@ if cartelera_fecha:
             t1_id = partido['id_t1']
             t2_id = partido['id_t2']
 
+            partido_en_vivo = partido['estado_codigo'] == 'in'
+            partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
+
+            # Si el partido está en vivo o finalizado, traemos boxscore para estadísticas reales al instante
+            datos_vivo_p = obtener_datos_en_vivo_espn(partido['event_id']) if (partido_en_vivo or partido_finalizado) else None
+
             t1_b2b = (str(t1_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
             t2_b2b = (str(t2_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
 
@@ -1208,8 +1297,12 @@ if cartelera_fecha:
             origen_ou_partido = ctx_partido['origen_linea']
             factor_paliza_partido = ctx_partido['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
 
-            ajustes_t1, bajas_t1 = obtener_ajustes_equipo_cached(t1_id)
-            ajustes_t2, bajas_t2 = obtener_ajustes_equipo_cached(t2_id)
+            ajustes_t1, bajas_t1 = obtener_ajustes_equipo_cached(
+                t1_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
+            )
+            ajustes_t2, bajas_t2 = obtener_ajustes_equipo_cached(
+                t2_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
+            )
 
             badges_ctx = []
             if t1_b2b:
@@ -1220,11 +1313,10 @@ if cartelera_fecha:
                 badges_ctx.append(f"🚨 Riesgo Paliza {ctx_partido['riesgo_paliza']} (Spread ~{ctx_partido['spread_proyectado']} pts)")
             str_badges = f" | {' · '.join(badges_ctx)}" if badges_ctx else ""
 
-            partido_en_vivo = partido['estado_codigo'] == 'in'
-            partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
-
             if partido_en_vivo:
                 marcador_str = f" 🔴 EN VIVO ({partido['estado']}): **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
+            elif partido_finalizado:
+                marcador_str = f" 🏁 FINAL: **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
             else:
                 marcador_str = f" | Estado: `{partido['estado']}`"
 
@@ -1239,73 +1331,131 @@ if cartelera_fecha:
                 txt_b1 = f"**{partido['abrev_t1']} OUT:** {', '.join([b['nombre'] for b in bajas_t1])}" if bajas_t1 else ""
                 txt_b2 = f"**{partido['abrev_t2']} OUT:** {', '.join([b['nombre'] for b in bajas_t2])}" if bajas_t2 else ""
                 separador = " | " if (txt_b1 and txt_b2) else ""
-                st.warning(f"🏥 **Bajas detectadas (Capa 5 activa):** {txt_b1}{separador}{txt_b2}")
+                st.warning(f"🏥 **Bajas excluidas automáticamente (Capa 5 activa):** {txt_b1}{separador}{txt_b2}")
            
             jugadores_t1 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t1_id]
             jugadores_t2 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t2_id]
+
+            top_t1 = hallar_top_jugadores_activos(jugadores_t1, ajustes_t1, top_n=2)
+            top_t2 = hallar_top_jugadores_activos(jugadores_t2, ajustes_t2, top_n=2)
+
+            def procesar_jugadores_equipo_resumen(lista_top, abrev_eq, ajustes_eq, en_b2b_eq, def_rtg_op):
+                for idx_j, cand_j in enumerate(lista_top):
+                    nom_j, pts_j, reb_j, ast_j, min_j, stat_j, id_j, df_j_full, df_j_prev = cand_j
+                    lineas_auto = calcular_lineas_automaticas_jugador(df_j_prev)
+
+                    aj = ajustes_eq.get(nom_j, {})
+                    min_aj_c5 = aj.get('min_ajustados', min_j)
+                    min_aj_ctx, notas_min = aplicar_ajustes_fatiga_y_paliza_minutos(
+                        min_aj_c5, en_b2b=en_b2b_eq, factor_recorte_paliza=factor_paliza_partido
+                    )
+                    bump = aj.get('factor_usage_bump', 1.0)
+                    min_eval = min_aj_ctx if usar_min_automaticos else min_proj_manual
+
+                    proy = calcular_proyeccion_jugador_capa2_3(
+                        df_jugador=df_j_prev,
+                        minutos_proyectados=min_eval,
+                        linea_pts=lineas_auto['pts'],
+                        linea_reb=lineas_auto['reb'],
+                        linea_ast=lineas_auto['ast'],
+                        posesiones_partido=ctx_partido['posesiones_esperadas'],
+                        def_rtg_rival=def_rtg_op,
+                        promedios_liga=promedios_liga,
+                        factor_usage_bump=bump,
+                        min_base_sin_bajas=min_j,
+                        en_b2b=en_b2b_eq
+                    )
+                    lambda_pts = proy['lambda_pts'] if proy else pts_j
+                    prob_more = proy['prob_more_pts'] if proy else 50.0
+                    rec_pts = "MÁS" if prob_more > 50 else "MENOS"
+                    prob_rec = max(prob_more, 100.0 - prob_more)
+                    es_alta_conf = prob_rec >= UMBRAL_ALTA_CONFIANZA
+
+                    # Evaluar estado real (Finalizado, En Vivo o Pendiente)
+                    pts_real_str = "-"
+                    reb_real_str = "-"
+                    ast_real_str = "-"
+                    res_estado = "Pendiente"
+
+                    if partido_finalizado:
+                        partido_j_fecha = df_j_full[df_j_full['FECHA'] == fecha_busqueda_str]
+                        if not partido_j_fecha.empty and partido_j_fecha.iloc[0]['MIN'] > 0:
+                            p_real = partido_j_fecha.iloc[0]['PTS']
+                            r_real = partido_j_fecha.iloc[0]['REB']
+                            a_real = partido_j_fecha.iloc[0]['AST']
+                            pts_real_str = f"{p_real} pts"
+                            reb_real_str = f"{r_real} reb"
+                            ast_real_str = f"{a_real} ast"
+                            res_estado = evaluar_resultado_linea(p_real, lineas_auto['pts'], rec_pts)
+                        elif datos_vivo_p:
+                            jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
+                            if jv and jv["MIN_ACTUAL"] > 0:
+                                pts_real_str = f"{jv['PTS_ACTUAL']} pts"
+                                reb_real_str = f"{jv['REB_ACTUAL']} reb"
+                                ast_real_str = f"{jv['AST_ACTUAL']} ast"
+                                res_estado = evaluar_resultado_linea(jv['PTS_ACTUAL'], lineas_auto['pts'], rec_pts)
+                            else:
+                                res_estado = "No jugó"
+                        else:
+                            res_estado = "No jugó"
+
+                    elif partido_en_vivo and datos_vivo_p:
+                        jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
+                        if jv:
+                            pts_real_str = f"🔴 {jv['PTS_ACTUAL']} pts ({jv['MIN_ACTUAL']:.0f}m)"
+                            reb_real_str = f"{jv['REB_ACTUAL']}"
+                            ast_real_str = f"{jv['AST_ACTUAL']}"
+                            if rec_pts == "MÁS" and jv['PTS_ACTUAL'] > lineas_auto['pts']:
+                                res_estado = "🟢 Superada (Vivo)"
+                            elif rec_pts == "MENOS" and jv['PTS_ACTUAL'] > lineas_auto['pts']:
+                                res_estado = "🔴 Superada en contra"
+                            else:
+                                res_estado = f"⏳ En juego ({partido['estado']})"
+
+                    resumen_jugadores.append({
+                        'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf else 'Estándar',
+                        'Encuentro': partido['encuentro'],
+                        'Jugador': nom_j,
+                        'Equipo': abrev_eq,
+                        'Estatus': stat_j,
+                        'Min Proy.': round(min_eval, 1),
+                        'Λ Pts': lambda_pts,
+                        'Línea Pts': lineas_auto['pts'],
+                        'Predicción Pts': f"{rec_pts} {lineas_auto['pts']}",
+                        'Prob_Num': round(prob_rec, 1),
+                        'Prob.': f"{prob_rec:.1f}%",
+                        'Proy. REB/AST': f"{proy['lambda_reb']:.1f}R / {proy['lambda_ast']:.1f}A",
+                        'Real / Vivo': pts_real_str,
+                        'REB/AST Real': f"{reb_real_str} / {ast_real_str}" if reb_real_str != "-" else "-",
+                        'Resultado': res_estado
+                    })
+
+            procesar_jugadores_equipo_resumen(top_t1, partido['abrev_t1'], ajustes_t1, t1_b2b, ctx_partido['eq2_stats']['def_rtg'])
+            procesar_jugadores_equipo_resumen(top_t2, partido['abrev_t2'], ajustes_t2, t2_b2b, ctx_partido['eq1_stats']['def_rtg'])
            
             col_p1, col_p2 = st.columns(2)
            
-            # Procesar Estrella Activa 1
-            estrella_1 = hallar_estrella_activa_real(jugadores_t1, ajustes_t1)
+            # Mostrar Tarjeta Estrella Principal Equipo 1
             with col_p1:
-                if estrella_1:
-                    nom_1, pts_1, reb_1, ast_1, min_1, stat_1, id_1, df_j1_full, df_j1_prev = estrella_1
+                if top_t1:
+                    nom_1, pts_1, reb_1, ast_1, min_1, stat_1, id_1, df_j1_full, df_j1_prev = top_t1[0]
                     lineas_auto_1 = calcular_lineas_automaticas_jugador(df_j1_prev)
-
                     aj_1 = ajustes_t1.get(nom_1, {})
-                    min_aj_capa5_1 = aj_1.get('min_ajustados', min_1)
                     min_aj_ctx_1, notas_min_1 = aplicar_ajustes_fatiga_y_paliza_minutos(
-                        min_aj_capa5_1, en_b2b=t1_b2b, factor_recorte_paliza=factor_paliza_partido
+                        aj_1.get('min_ajustados', min_1), en_b2b=t1_b2b, factor_recorte_paliza=factor_paliza_partido
                     )
-                    bump_1 = aj_1.get('factor_usage_bump', 1.0)
                     min_eval_1 = min_aj_ctx_1 if usar_min_automaticos else min_proj_manual
-
                     proy_1 = calcular_proyeccion_jugador_capa2_3(
-                        df_jugador=df_j1_prev,
-                        minutos_proyectados=min_eval_1,
-                        linea_pts=lineas_auto_1['pts'],
-                        linea_reb=lineas_auto_1['reb'],
-                        linea_ast=lineas_auto_1['ast'],
-                        posesiones_partido=ctx_partido['posesiones_esperadas'],
-                        def_rtg_rival=ctx_partido['eq2_stats']['def_rtg'],
-                        promedios_liga=promedios_liga,
-                        factor_usage_bump=bump_1,
-                        min_base_sin_bajas=min_1,
-                        en_b2b=t1_b2b
+                        df_jugador=df_j1_prev, minutos_proyectados=min_eval_1,
+                        linea_pts=lineas_auto_1['pts'], linea_reb=lineas_auto_1['reb'], linea_ast=lineas_auto_1['ast'],
+                        posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq2_stats']['def_rtg'],
+                        promedios_liga=promedios_liga, factor_usage_bump=aj_1.get('factor_usage_bump', 1.0),
+                        min_base_sin_bajas=min_1, en_b2b=t1_b2b
                     )
                     lambda_p1 = proy_1['lambda_pts'] if proy_1 else pts_1
                     prob_p1 = proy_1['prob_more_pts'] if proy_1 else 50.0
-                    rec_p1 = "MÁS" if prob_p1 > 50 else "MENOS"
                     prob_rec_1 = max(prob_p1, 100.0 - prob_p1)
                     es_alta_conf_1 = prob_rec_1 >= UMBRAL_ALTA_CONFIANZA
-                   
-                    partido_j1_fecha = df_j1_full[df_j1_full['FECHA'] == fecha_busqueda_str]
-                    res_j1 = "Pendiente"
-                    pts_real_str_1 = "-"
-                   
-                    if partido_finalizado:
-                        if not partido_j1_fecha.empty and partido_j1_fecha.iloc[0]['MIN'] > 0:
-                            p_real_j1 = partido_j1_fecha.iloc[0]['PTS']
-                            pts_real_str_1 = f"{p_real_j1} pts"
-                            res_j1 = evaluar_resultado_linea(p_real_j1, lineas_auto_1['pts'], rec_p1)
-                        else:
-                            res_j1 = "No jugó / Lesionado"
-
-                    resumen_jugadores.append({
-                        'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_1 else 'Estándar',
-                        'Jugador': nom_1,
-                        'Equipo': partido['abrev_t1'],
-                        'Contexto': ', '.join(notas_min_1) if notas_min_1 else 'Normal',
-                        'Min Proy.': round(min_eval_1, 1),
-                        'Λ Pts': lambda_p1,
-                        'Línea Auto Pts': lineas_auto_1['pts'],
-                        'Predicción': f"{rec_p1} {lineas_auto_1['pts']}",
-                        'Prob_Num': round(prob_rec_1, 1),
-                        'Prob.': f"{prob_rec_1:.1f}%",
-                        'Real': pts_real_str_1,
-                        'Resultado': res_j1
-                    })
 
                     etiqueta_extra_1 = f" | {', '.join(notas_min_1)}" if notas_min_1 else ""
                     sello_exp_1 = " 🔥 ALTA CONFIANZA" if es_alta_conf_1 else ""
@@ -1320,68 +1470,29 @@ if cartelera_fecha:
                             st.session_state['jugador_seleccionado'] = nom_1
                             st.rerun()
                 else:
-                    st.info(f"Sin datos activos para {partido['abrev_t1']}")
+                    st.info(f"Sin jugadores sanos activos para {partido['abrev_t1']}")
 
-            # Procesar Estrella Activa 2
-            estrella_2 = hallar_estrella_activa_real(jugadores_t2, ajustes_t2)
+            # Mostrar Tarjeta Estrella Principal Equipo 2
             with col_p2:
-                if estrella_2:
-                    nom_2, pts_2, reb_2, ast_2, min_2, stat_2, id_2, df_j2_full, df_j2_prev = estrella_2
+                if top_t2:
+                    nom_2, pts_2, reb_2, ast_2, min_2, stat_2, id_2, df_j2_full, df_j2_prev = top_t2[0]
                     lineas_auto_2 = calcular_lineas_automaticas_jugador(df_j2_prev)
-
                     aj_2 = ajustes_t2.get(nom_2, {})
-                    min_aj_capa5_2 = aj_2.get('min_ajustados', min_2)
                     min_aj_ctx_2, notas_min_2 = aplicar_ajustes_fatiga_y_paliza_minutos(
-                        min_aj_capa5_2, en_b2b=t2_b2b, factor_recorte_paliza=factor_paliza_partido
+                        aj_2.get('min_ajustados', min_2), en_b2b=t2_b2b, factor_recorte_paliza=factor_paliza_partido
                     )
-                    bump_2 = aj_2.get('factor_usage_bump', 1.0)
                     min_eval_2 = min_aj_ctx_2 if usar_min_automaticos else min_proj_manual
-
                     proy_2 = calcular_proyeccion_jugador_capa2_3(
-                        df_jugador=df_j2_prev,
-                        minutos_proyectados=min_eval_2,
-                        linea_pts=lineas_auto_2['pts'],
-                        linea_reb=lineas_auto_2['reb'],
-                        linea_ast=lineas_auto_2['ast'],
-                        posesiones_partido=ctx_partido['posesiones_esperadas'],
-                        def_rtg_rival=ctx_partido['eq1_stats']['def_rtg'],
-                        promedios_liga=promedios_liga,
-                        factor_usage_bump=bump_2,
-                        min_base_sin_bajas=min_2,
-                        en_b2b=t2_b2b
+                        df_jugador=df_j2_prev, minutos_proyectados=min_eval_2,
+                        linea_pts=lineas_auto_2['pts'], linea_reb=lineas_auto_2['reb'], linea_ast=lineas_auto_2['ast'],
+                        posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq1_stats']['def_rtg'],
+                        promedios_liga=promedios_liga, factor_usage_bump=aj_2.get('factor_usage_bump', 1.0),
+                        min_base_sin_bajas=min_2, en_b2b=t2_b2b
                     )
                     lambda_p2 = proy_2['lambda_pts'] if proy_2 else pts_2
                     prob_p2 = proy_2['prob_more_pts'] if proy_2 else 50.0
-                    rec_p2 = "MÁS" if prob_p2 > 50 else "MENOS"
                     prob_rec_2 = max(prob_p2, 100.0 - prob_p2)
                     es_alta_conf_2 = prob_rec_2 >= UMBRAL_ALTA_CONFIANZA
-                   
-                    partido_j2_fecha = df_j2_full[df_j2_full['FECHA'] == fecha_busqueda_str]
-                    res_j2 = "Pendiente"
-                    pts_real_str_2 = "-"
-                   
-                    if partido_finalizado:
-                        if not partido_j2_fecha.empty and partido_j2_fecha.iloc[0]['MIN'] > 0:
-                            p_real_j2 = partido_j2_fecha.iloc[0]['PTS']
-                            pts_real_str_2 = f"{p_real_j2} pts"
-                            res_j2 = evaluar_resultado_linea(p_real_j2, lineas_auto_2['pts'], rec_p2)
-                        else:
-                            res_j2 = "No jugó / Lesionado"
-
-                    resumen_jugadores.append({
-                        'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_2 else 'Estándar',
-                        'Jugador': nom_2,
-                        'Equipo': partido['abrev_t2'],
-                        'Contexto': ', '.join(notas_min_2) if notas_min_2 else 'Normal',
-                        'Min Proy.': round(min_eval_2, 1),
-                        'Λ Pts': lambda_p2,
-                        'Línea Auto Pts': lineas_auto_2['pts'],
-                        'Predicción': f"{rec_p2} {lineas_auto_2['pts']}",
-                        'Prob_Num': round(prob_rec_2, 1),
-                        'Prob.': f"{prob_rec_2:.1f}%",
-                        'Real': pts_real_str_2,
-                        'Resultado': res_j2
-                    })
 
                     etiqueta_extra_2 = f" | {', '.join(notas_min_2)}" if notas_min_2 else ""
                     sello_exp_2 = " 🔥 ALTA CONFIANZA" if es_alta_conf_2 else ""
@@ -1396,7 +1507,7 @@ if cartelera_fecha:
                             st.session_state['jugador_seleccionado'] = nom_2
                             st.rerun()
                 else:
-                    st.info(f"Sin datos activos para {partido['abrev_t2']}")
+                    st.info(f"Sin jugadores sanos activos para {partido['abrev_t2']}")
            
             # Resultados colectivos basados en Capa 1 + Línea O/U Automática + B2B
             prob_t1 = ctx_partido['prob_t1']
@@ -1409,20 +1520,20 @@ if cartelera_fecha:
             max_prob_val = max(prob_t1, prob_t2)
             es_alta_conf_eq = max_prob_val >= UMBRAL_ALTA_CONFIANZA or prob_total_rec >= UMBRAL_ALTA_CONFIANZA
 
+            s1 = partido['score_t1']
+            s2 = partido['score_t2']
+            total_actual = s1 + s2
+
             if partido_finalizado:
-                s1 = partido['score_t1']
-                s2 = partido['score_t2']
-                total_real = s1 + s2
                 ganador_real = partido['abrev_t1'] if s1 > s2 else partido['abrev_t2']
-               
-                cumplio_total = evaluar_resultado_linea(total_real, linea_ou_partido, verdict_partido_total)
+                cumplio_total = evaluar_resultado_linea(total_actual, linea_ou_partido, verdict_partido_total)
                 acerto_ganador = "🟢 Acierto" if ganador_recomendado == ganador_real else "🔴 Fallo"
                
                 resumen_equipos.append({
                     'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_eq else 'Estándar',
                     'Hora (ECT)': partido['hora_ecuador'],
                     'Encuentro': partido['encuentro'],
-                    'Riesgo Paliza': ctx_partido['riesgo_paliza'],
+                    'Marcador': f"🏁 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
                     'Ganador Sugerido': ganador_recomendado,
                     'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
                     'Prob. Victoria': max_prob_val,
@@ -1430,26 +1541,57 @@ if cartelera_fecha:
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
                     'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}%)",
-                    'Total Real': total_real,
+                    'Total Real / Vivo': f"{total_actual} pts",
                     'Resultado Total': cumplio_total,
                     'Estado': 'Finalizado'
                 })
 
-                st.info(f"📊 **Resultado Final Real:** {partido['abrev_t1']} **{s1} - {s2}** {partido['abrev_t2']} (Total: {total_real} pts)")
+                st.info(f"📊 **Resultado Final Real:** {partido['abrev_t1']} **{s1} - {s2}** {partido['abrev_t2']} (Total: {total_actual} pts)")
                 col_res1, col_res2 = st.columns(2)
                 with col_res1:
                     st.markdown(f"**Ganador Recomendado:** {ganador_recomendado} | **Real:** {ganador_real} → {acerto_ganador}")
                 with col_res2:
                     st.markdown(
                         f"**Total Partido (Línea {linea_ou_partido} - {origen_ou_partido}):** Proyectado {total_proyectado_partido:.1f} "
-                        f"(**{verdict_partido_total} {linea_ou_partido}**) | Real: **{total_real}** → {cumplio_total}"
+                        f"(**{verdict_partido_total} {linea_ou_partido}**) | Real: **{total_actual}** → {cumplio_total}"
+                    )
+            elif partido_en_vivo:
+                lider_actual = partido['abrev_t1'] if s1 > s2 else (partido['abrev_t2'] if s2 > s1 else "Empate")
+                estado_ganador_vivo = "🟢 Liderando" if lider_actual == ganador_recomendado else ("🟡 Empatado" if lider_actual == "Empate" else "🔴 Abajo")
+
+                resumen_equipos.append({
+                    'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_eq else 'Estándar',
+                    'Hora (ECT)': partido['hora_ecuador'],
+                    'Encuentro': partido['encuentro'],
+                    'Marcador': f"🔴 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
+                    'Ganador Sugerido': ganador_recomendado,
+                    'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
+                    'Prob. Victoria': max_prob_val,
+                    'Resultado Ganador': estado_ganador_vivo,
+                    'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
+                    'Pts Proyectados': total_proyectado_partido,
+                    'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}%)",
+                    'Total Real / Vivo': f"🔴 {total_actual} pts",
+                    'Resultado Total': f"⏳ {partido['estado']}",
+                    'Estado': f"🔴 {partido['estado']}"
+                })
+
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    sello_ml = " 🔥 ALTA CONFIANZA" if max_prob_val >= UMBRAL_ALTA_CONFIANZA else ""
+                    st.success(f"🏆 **Ganador Recomendado:** **{ganador_recomendado}** ({max_prob_val:.1f}%){sello_ml} | Vivo: **{estado_ganador_vivo}**")
+                with col_r2:
+                    sello_ou = " 🔥 ALTA CONFIANZA" if prob_total_rec >= UMBRAL_ALTA_CONFIANZA else ""
+                    st.warning(
+                        f"📈 **Total Partido (Línea {linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → "
+                        f"**{verdict_partido_total} ({prob_total_rec:.1f}%)**{sello_ou} | Acumulado: **{total_actual} pts**"
                     )
             else:
                 resumen_equipos.append({
                     'Nivel': '🔥 ALTA CONFIANZA' if es_alta_conf_eq else 'Estándar',
                     'Hora (ECT)': partido['hora_ecuador'],
                     'Encuentro': partido['encuentro'],
-                    'Riesgo Paliza': ctx_partido['riesgo_paliza'],
+                    'Marcador': '-',
                     'Ganador Sugerido': ganador_recomendado,
                     'Prob_Max_Num': round(max(max_prob_val, prob_total_rec), 1),
                     'Prob. Victoria': max_prob_val,
@@ -1457,7 +1599,7 @@ if cartelera_fecha:
                     'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
                     'Pts Proyectados': total_proyectado_partido,
                     'Predicción Total': f"{verdict_partido_total} ({prob_total_rec:.1f}%)",
-                    'Total Real': '-',
+                    'Total Real / Vivo': '-',
                     'Resultado Total': 'Pendiente',
                     'Estado': partido['estado']
                 })
@@ -1479,12 +1621,12 @@ else:
     st.info(f"No hay partidos registrados en la cartelera oficial para la fecha: {fecha_seleccionada}.")
 
 # ==============================================================================
-# 8. RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES ESTELARES (CON FILTRO ALTA CONFIANZA)
+# 8. RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES ESTELARES (CON MARCADORES EN VIVO)
 # ==============================================================================
 
 if resumen_equipos:
-    st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Jornada)")
-    st.markdown("Tabla interactiva con insignia **🔥 ALTA CONFIANZA (≥62%)**, líneas Over/Under automáticas, fatiga B2B y riesgo de paliza.")
+    st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos y Marcadores en Vivo")
+    st.markdown("Tabla sincronizada en tiempo real con **marcadores en vivo (`🔴`)**, totales acumulados, líneas O/U e insignia **🔥 ALTA CONFIANZA (≥62%)**.")
    
     df_equipos = pd.DataFrame(resumen_equipos)
     if solo_alta_confianza:
@@ -1506,8 +1648,8 @@ if resumen_equipos:
     st.markdown("---")
 
 if resumen_jugadores:
-    st.subheader("⭐ Resumen Ejecutivo: Estrellas Activas (Líneas Automáticas)")
-    st.markdown("Predicciones individuales con insignia **🔥 ALTA CONFIANZA (≥62%)**, líneas auto-calculadas, ajuste B2B, riesgo de paliza y Usage Bump.")
+    st.subheader("⭐ Resumen Ejecutivo: Figuras Sanas Activas y Progreso en Vivo")
+    st.markdown("Incluye el **Top 2 de jugadores sanos por equipo** (excluyendo lesionados/OUT), su **progreso actual en vivo**, minutos y proyecciones de PTS/REB/AST.")
    
     df_jugadores_res = pd.DataFrame(resumen_jugadores)
     if solo_alta_confianza:
@@ -1524,11 +1666,11 @@ if resumen_jugadores:
         )
         st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True)
     else:
-        st.info("Ningún jugador estelar supera el umbral de Alta Confianza (≥62%) en esta jornada.")
+        st.info("Ningún jugador activo supera el umbral de Alta Confianza (≥62%) en esta jornada.")
     st.markdown("---")
 
 # ==============================================================================
-# 9. ANÁLISIS DETALLADO DEL JUGADOR (CAPAS 2, 3, 4 EN VIVO CORREGIDA Y 5)
+# 9. ANÁLISIS DETALLADO DEL JUGADOR (CAPAS 2, 3, 4 EN VIVO Y 5)
 # ==============================================================================
 
 if 'jugador_seleccionado' in st.session_state and st.session_state['jugador_seleccionado'] in nombres_disponibles:
@@ -1544,11 +1686,22 @@ if jugador_activo:
     equipo_jugador = info_sel['team_name']
     team_id_jugador = str(info_sel['team_id'])
 
-    ajustes_eq_jugador, bajas_eq_jugador = obtener_ajustes_equipo_cached(team_id_jugador)
+    evento_jugador = next(
+        (p for p in cartelera_fecha if team_id_jugador in (str(p["id_t1"]), str(p["id_t2"]))),
+        None
+    )
+    datos_vivo_ev = obtener_datos_en_vivo_espn(evento_jugador["event_id"]) if evento_jugador else None
+
+    ajustes_eq_jugador, bajas_eq_jugador = obtener_ajustes_equipo_cached(
+        team_id_jugador,
+        evento_jugador.get('bajas_evento_ids') if evento_jugador else None,
+        evento_jugador.get('bajas_evento_nombres') if evento_jugador else None,
+        datos_vivo_ev
+    )
     ajuste_indiv_capa5 = ajustes_eq_jugador.get(jugador_activo, {})
 
     if ajuste_indiv_capa5.get('esta_out', False):
-        st.error(f"🚫 **{jugador_activo}** está marcado actualmente como **OUT / BAJA**. Desmárcalo en el sidebar ('Forzar Jugadores como IN') si deseas proyectar su línea.")
+        st.error(f"🚫 **{jugador_activo}** está detectado actualmente como **OUT / LESIONADO / INACTIVO** ({info_sel.get('status')}). Desmárcalo en el sidebar ('Forzar Jugadores como IN') si deseas proyectar su línea.")
 
     with st.spinner(f"Analizando estadísticas en tiempo real para {jugador_activo}..."):
         df_jugador_full = consultar_gamelog_jugador(id_seleccionado)
@@ -1572,11 +1725,6 @@ if jugador_activo:
                 f"Multiplicador de Uso: **x{ajuste_indiv_capa5['factor_usage_bump']:.2f}** | "
                 f"Detalle: {'; '.join(ajuste_indiv_capa5['motivos'])}"
             )
-
-        evento_jugador = next(
-            (p for p in cartelera_fecha if team_id_jugador in (str(p["id_t1"]), str(p["id_t2"]))),
-            None
-        )
 
         posesiones_ctx = None
         def_rtg_rival_ctx = None
@@ -1633,10 +1781,11 @@ if jugador_activo:
             en_b2b=en_b2b_jugador
         )
 
-        # --- PANEL DINÁMICO EN VIVO (CAPA 4 - POLLING CADA 30s SIN BLOQUEO DE CACHÉ) ---
+        # --- PANEL DINÁMICO EN VIVO (CAPA 4 - POLLING CADA 30s) ---
         if evento_jugador and modo_vivo and proy_detallada and not ajuste_indiv_capa5.get('esta_out', False):
             @st.fragment(run_every=30)
             def panel_en_vivo_capa4():
+                obtener_datos_en_vivo_espn.clear()
                 datos_vivo = obtener_datos_en_vivo_espn(evento_jugador["event_id"])
                 if not datos_vivo:
                     return
