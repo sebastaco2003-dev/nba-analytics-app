@@ -250,7 +250,7 @@ def obtener_tabla_completa_lesiones_nba():
 # 1. EXTRACCIÓN DE DATOS BASE (CARTELERA, REPORTES MÉDICOS, B2B Y ROSTERS)
 # ==============================================================================
 
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=20)
 def obtener_cartelera_por_fecha(fecha_str):
     url_scoreboard = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={fecha_str}"
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -1138,7 +1138,7 @@ def parsear_minutos_jugados_boxscore(val_min):
         return 0.0
 
 
-@st.cache_data(ttl=25)
+@st.cache_data(ttl=15)
 def obtener_datos_en_vivo_espn(event_id):
     if not event_id:
         return None
@@ -1566,663 +1566,683 @@ tab_modelo, tab_buscador = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: MOTOR PROBABILÍSTICO Y CARTELERA
+# PESTAÑA 1: MOTOR PROBABILÍSTICO Y CARTELERA (CON AUTO-POLLING EN VIVO CADA 30s)
 # ------------------------------------------------------------------------------
 with tab_modelo:
-    st.subheader(f"📅 Cartelera de Partidos (Hora de Ecuador - UTC-5) — Fecha: {fecha_seleccionada}")
+    @st.fragment(run_every=30 if modo_vivo else None)
+    def renderizar_tablero_principal():
+        if modo_vivo:
+            obtener_cartelera_por_fecha.clear()
+            obtener_datos_en_vivo_espn.clear()
 
-    resumen_equipos = []
-    resumen_jugadores = []
-    cache_ajustes_equipos = {}
+        cartelera_actual = obtener_cartelera_por_fecha(fecha_str_api)
 
-    def obtener_ajustes_equipo_cached(team_id, bajas_ev_ids=None, bajas_ev_noms=None, datos_vivo=None):
-        tid = str(team_id)
-        if tid not in cache_ajustes_equipos:
-            cache_ajustes_equipos[tid] = calcular_ajustes_rotacion_capa5(
-                team_id=tid,
-                catalogo_jugadores=catalogo_jugadores,
-                bajas_manuales_out=bajas_manuales_out,
-                altas_manuales_in=altas_manuales_in,
-                fecha_limite_str=fecha_busqueda_str,
-                incluir_bajas_automaticas_espn=incluir_bajas_espn,
-                bajas_evento_ids=bajas_ev_ids,
-                bajas_evento_nombres=bajas_ev_noms,
-                datos_vivo_partido=datos_vivo
-            )
-        return cache_ajustes_equipos[tid]
+        st.subheader(f"📅 Cartelera de Partidos (Hora de Ecuador - UTC-5) — Fecha: {fecha_seleccionada}")
+        if modo_vivo:
+            hora_lectura = datetime.now(timezone(timedelta(hours=-5))).strftime("%H:%M:%S")
+            st.caption(f"🟢 Sincronización automática en vivo activa (cada 30s) • Última actualización: **{hora_lectura} ECT**")
 
-    def hallar_top_jugadores_activos(lista_jugadores, ajustes_equipo, top_n=2):
-        candidatos = []
-        for nom, inf in lista_jugadores[:25]:
-            aj = ajustes_equipo.get(nom, {})
-            if aj.get('esta_out', False):
-                continue
-            if es_estatus_baja(inf.get('status', 'Active')) and nom not in altas_manuales_in:
-                continue
+        resumen_equipos = []
+        resumen_jugadores = []
+        cache_ajustes_equipos = {}
 
-            df_t = consultar_gamelog_jugador(inf['id'])
-            if df_t is not None and len(df_t) >= 3:
-                df_prev = obtener_historial_previo_sin_leakage(df_t, fecha_busqueda_str)
-                df_v = df_prev[df_prev['MIN'] > 0].head(10)
-                if df_v.empty:
+        def obtener_ajustes_equipo_cached(team_id, bajas_ev_ids=None, bajas_ev_noms=None, datos_vivo=None):
+            tid = str(team_id)
+            if tid not in cache_ajustes_equipos:
+                cache_ajustes_equipos[tid] = calcular_ajustes_rotacion_capa5(
+                    team_id=tid,
+                    catalogo_jugadores=catalogo_jugadores,
+                    bajas_manuales_out=bajas_manuales_out,
+                    altas_manuales_in=altas_manuales_in,
+                    fecha_limite_str=fecha_busqueda_str,
+                    incluir_bajas_automaticas_espn=incluir_bajas_espn,
+                    bajas_evento_ids=bajas_ev_ids,
+                    bajas_evento_nombres=bajas_ev_noms,
+                    datos_vivo_partido=datos_vivo
+                )
+            return cache_ajustes_equipos[tid]
+
+        def hallar_top_jugadores_activos(lista_jugadores, ajustes_equipo, top_n=2):
+            candidatos = []
+            for nom, inf in lista_jugadores[:25]:
+                aj = ajustes_equipo.get(nom, {})
+                if aj.get('esta_out', False):
                     continue
-                st_p = calcular_estadisticas_ponderadas_jugador(df_prev)
-                min_prom = st_p['min']
-                pts_prom = st_p['pts']
-                reb_prom = st_p['reb']
-                ast_prom = st_p['ast']
-               
-                if min_prom >= 18.0:
-                    score_jerarquia = pts_prom * 1.25 + reb_prom + ast_prom
-                    candidatos.append((
-                        score_jerarquia,
-                        (nom, pts_prom, reb_prom, ast_prom, min_prom, inf.get('status', 'Active'), str(inf['id']), df_t, df_prev)
-                    ))
+                if es_estatus_baja(inf.get('status', 'Active')) and nom not in altas_manuales_in:
+                    continue
 
-        candidatos.sort(key=lambda x: x[0], reverse=True)
-        return [item[1] for item in candidatos[:top_n]]
+                df_t = consultar_gamelog_jugador(inf['id'])
+                if df_t is not None and len(df_t) >= 3:
+                    df_prev = obtener_historial_previo_sin_leakage(df_t, fecha_busqueda_str)
+                    df_v = df_prev[df_prev['MIN'] > 0].head(10)
+                    if df_v.empty:
+                        continue
+                    st_p = calcular_estadisticas_ponderadas_jugador(df_prev)
+                    min_prom = st_p['min']
+                    pts_prom = st_p['pts']
+                    reb_prom = st_p['reb']
+                    ast_prom = st_p['ast']
+                   
+                    if min_prom >= 18.0:
+                        score_jerarquia = pts_prom * 1.25 + reb_prom + ast_prom
+                        candidatos.append((
+                            score_jerarquia,
+                            (nom, pts_prom, reb_prom, ast_prom, min_prom, inf.get('status', 'Active'), str(inf['id']), df_t, df_prev)
+                        ))
 
-    def evaluar_resultado_linea(valor_real, linea_evaluada, recomendacion_str):
-        if valor_real == linea_evaluada:
-            return "🟡 Push (Empate)"
-        if recomendacion_str == "MÁS":
-            return "🟢 Acierto" if valor_real > linea_evaluada else "🔴 Fallo"
-        else:
-            return "🟢 Acierto" if valor_real < linea_evaluada else "🔴 Fallo"
+            candidatos.sort(key=lambda x: x[0], reverse=True)
+            return [item[1] for item in candidatos[:top_n]]
 
-    if cartelera_fecha:
-        for partido in cartelera_fecha:
-            with st.container():
-                t1_id = partido['id_t1']
-                t2_id = partido['id_t2']
+        def evaluar_resultado_linea(valor_real, linea_evaluada, recomendacion_str):
+            if valor_real == linea_evaluada:
+                return "🟡 Push (Empate)"
+            if recomendacion_str == "MÁS":
+                return "🟢 Acierto" if valor_real > linea_evaluada else "🔴 Fallo"
+            else:
+                return "🟢 Acierto" if valor_real < linea_evaluada else "🔴 Fallo"
 
-                partido_en_vivo = partido['estado_codigo'] == 'in'
-                partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
+        if cartelera_actual:
+            for partido in cartelera_actual:
+                with st.container():
+                    t1_id = partido['id_t1']
+                    t2_id = partido['id_t2']
 
-                datos_vivo_p = obtener_datos_en_vivo_espn(partido['event_id']) if (partido_en_vivo or partido_finalizado) else None
+                    partido_en_vivo = partido['estado_codigo'] == 'in'
+                    partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
 
-                t1_b2b = (str(t1_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
-                t2_b2b = (str(t2_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
+                    # Consultar summary en vivo si el partido está en curso, finalizado o en ventana de inicio
+                    datos_vivo_p = obtener_datos_en_vivo_espn(partido['event_id']) if (partido_en_vivo or partido_finalizado or modo_vivo) else None
 
-                ctx_partido = calcular_contexto_colectivo_capa1(
-                    t1_id, t2_id, metricas_equipos, promedios_liga,
-                    linea_mercado_ou=partido.get('linea_mercado_ou'),
-                    spread_mercado=partido.get('spread_mercado'),
-                    t1_en_b2b=t1_b2b,
-                    t2_en_b2b=t2_b2b
-                )
-                linea_ou_partido = ctx_partido['linea_evaluada']
-                origen_ou_partido = ctx_partido['origen_linea']
-                factor_paliza_partido = ctx_partido['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
+                    # Sincronizar marcador y estado en tiempo real desde summary si está disponible
+                    if datos_vivo_p and datos_vivo_p.get("marcadores"):
+                        marc_vivo = datos_vivo_p["marcadores"]
+                        if partido['abrev_t1'] in marc_vivo:
+                            partido['score_t1'] = marc_vivo[partido['abrev_t1']]
+                        if partido['abrev_t2'] in marc_vivo:
+                            partido['score_t2'] = marc_vivo[partido['abrev_t2']]
+                        if datos_vivo_p.get("estado"):
+                            partido['estado_codigo'] = datos_vivo_p["estado"]
+                        if datos_vivo_p.get("detalle_estado"):
+                            partido['estado'] = datos_vivo_p["detalle_estado"]
 
-                ajustes_t1, bajas_t1 = obtener_ajustes_equipo_cached(
-                    t1_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
-                )
-                ajustes_t2, bajas_t2 = obtener_ajustes_equipo_cached(
-                    t2_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
-                )
+                    partido_en_vivo = partido['estado_codigo'] == 'in'
+                    partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
 
-                badges_ctx = []
-                if t1_b2b:
-                    badges_ctx.append(f"🔋 {partido['abrev_t1']} en B2B")
-                if t2_b2b:
-                    badges_ctx.append(f"🔋 {partido['abrev_t2']} en B2B")
-                if ctx_partido['riesgo_paliza'] != "BAJO" and aplicar_b2b_y_paliza:
-                    badges_ctx.append(f"🚨 Riesgo Paliza {ctx_partido['riesgo_paliza']} (Spread ~{ctx_partido['spread_proyectado']} pts)")
-                str_badges = f" | {' · '.join(badges_ctx)}" if badges_ctx else ""
+                    t1_b2b = (str(t1_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
+                    t2_b2b = (str(t2_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
 
-                if partido_en_vivo:
-                    marcador_str = f" 🔴 EN VIVO ({partido['estado']}): **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
-                elif partido_finalizado:
-                    marcador_str = f" 🏁 FINAL: **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
-                else:
-                    marcador_str = f" | Estado: `{partido['estado']}`"
+                    ctx_partido = calcular_contexto_colectivo_capa1(
+                        t1_id, t2_id, metricas_equipos, promedios_liga,
+                        linea_mercado_ou=partido.get('linea_mercado_ou'),
+                        spread_mercado=partido.get('spread_mercado'),
+                        t1_en_b2b=t1_b2b,
+                        t2_en_b2b=t2_b2b
+                    )
+                    linea_ou_partido = ctx_partido['linea_evaluada']
+                    origen_ou_partido = ctx_partido['origen_linea']
+                    factor_paliza_partido = ctx_partido['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
 
-                st.markdown(f"### ⏰ [{partido['hora_ecuador']} ECT] 🏟️ {partido['encuentro']} — *{partido['detalle']}*{marcador_str}")
-                st.caption(
-                    f"⚡ **Ritmo Esperado:** {ctx_partido['posesiones_esperadas']} pos | "
-                    f"**{partido['abrev_t1']}:** Λ = {ctx_partido['lambda_t1']} pts | "
-                    f"**{partido['abrev_t2']}:** Λ = {ctx_partido['lambda_t2']} pts{str_badges}"
-                )
+                    ajustes_t1, bajas_t1 = obtener_ajustes_equipo_cached(
+                        t1_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
+                    )
+                    ajustes_t2, bajas_t2 = obtener_ajustes_equipo_cached(
+                        t2_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
+                    )
 
-                if bajas_t1 or bajas_t2:
-                    txt_b1 = f"**{partido['abrev_t1']} OUT:** {', '.join([b['nombre'] for b in bajas_t1])}" if bajas_t1 else ""
-                    txt_b2 = f"**{partido['abrev_t2']} OUT:** {', '.join([b['nombre'] for b in bajas_t2])}" if bajas_t2 else ""
-                    separador = " | " if (txt_b1 and txt_b2) else ""
-                    st.warning(f"🏥 **Bajas excluidas automáticamente (Capa 5 activa):** {txt_b1}{separador}{txt_b2}")
-               
-                jugadores_t1 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t1_id]
-                jugadores_t2 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t2_id]
+                    badges_ctx = []
+                    if t1_b2b:
+                        badges_ctx.append(f"🔋 {partido['abrev_t1']} en B2B")
+                    if t2_b2b:
+                        badges_ctx.append(f"🔋 {partido['abrev_t2']} en B2B")
+                    if ctx_partido['riesgo_paliza'] != "BAJO" and aplicar_b2b_y_paliza:
+                        badges_ctx.append(f"🚨 Riesgo Paliza {ctx_partido['riesgo_paliza']} (Spread ~{ctx_partido['spread_proyectado']} pts)")
+                    str_badges = f" | {' · '.join(badges_ctx)}" if badges_ctx else ""
 
-                top_t1 = hallar_top_jugadores_activos(jugadores_t1, ajustes_t1, top_n=2)
-                top_t2 = hallar_top_jugadores_activos(jugadores_t2, ajustes_t2, top_n=2)
+                    if partido_en_vivo:
+                        marcador_str = f" 🔴 EN VIVO ({partido['estado']}): **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
+                    elif partido_finalizado:
+                        marcador_str = f" 🏁 FINAL: **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
+                    else:
+                        marcador_str = f" | Estado: `{partido['estado']}`"
 
-                def procesar_jugadores_equipo_resumen(lista_top, abrev_eq, ajustes_eq, en_b2b_eq, def_rtg_op):
-                    for cand_j in lista_top:
-                        nom_j, pts_j, reb_j, ast_j, min_j, stat_j, id_j, df_j_full, df_j_prev = cand_j
-                        lineas_auto = calcular_lineas_automaticas_jugador(df_j_prev)
+                    st.markdown(f"### ⏰ [{partido['hora_ecuador']} ECT] 🏟️ {partido['encuentro']} — *{partido['detalle']}*{marcador_str}")
+                    st.caption(
+                        f"⚡ **Ritmo Esperado:** {ctx_partido['posesiones_esperadas']} pos | "
+                        f"**{partido['abrev_t1']}:** Λ = {ctx_partido['lambda_t1']} pts | "
+                        f"**{partido['abrev_t2']}:** Λ = {ctx_partido['lambda_t2']} pts{str_badges}"
+                    )
 
-                        aj = ajustes_eq.get(nom_j, {})
-                        min_aj_c5 = aj.get('min_ajustados', min_j)
-                        min_aj_ctx, _ = aplicar_ajustes_fatiga_y_paliza_minutos(
-                            min_aj_c5, en_b2b=en_b2b_eq, factor_recorte_paliza=factor_paliza_partido
-                        )
-                        bump = aj.get('factor_usage_bump', 1.0)
-                        min_eval = min_aj_ctx if usar_min_automaticos else min_proj_manual
+                    if bajas_t1 or bajas_t2:
+                        txt_b1 = f"**{partido['abrev_t1']} OUT:** {', '.join([b['nombre'] for b in bajas_t1])}" if bajas_t1 else ""
+                        txt_b2 = f"**{partido['abrev_t2']} OUT:** {', '.join([b['nombre'] for b in bajas_t2])}" if bajas_t2 else ""
+                        separador = " | " if (txt_b1 and txt_b2) else ""
+                        st.warning(f"🏥 **Bajas excluidas automáticamente (Capa 5 activa):** {txt_b1}{separador}{txt_b2}")
+                   
+                    jugadores_t1 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t1_id]
+                    jugadores_t2 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t2_id]
 
-                        proy = calcular_proyeccion_jugador_capa2_3(
-                            df_jugador=df_j_prev,
-                            minutos_proyectados=min_eval,
-                            linea_pts=lineas_auto['pts'],
-                            linea_reb=lineas_auto['reb'],
-                            linea_ast=lineas_auto['ast'],
-                            linea_pra=lineas_auto['pra'],
-                            posesiones_partido=ctx_partido['posesiones_esperadas'],
-                            def_rtg_rival=def_rtg_op,
-                            promedios_liga=promedios_liga,
-                            factor_usage_bump=bump,
-                            min_base_sin_bajas=min_j,
-                            en_b2b=en_b2b_eq
-                        )
-                        if not proy:
-                            continue
+                    top_t1 = hallar_top_jugadores_activos(jugadores_t1, ajustes_t1, top_n=2)
+                    top_t2 = hallar_top_jugadores_activos(jugadores_t2, ajustes_t2, top_n=2)
 
-                        if "Mejor Mercado Auto" in modo_mercado_resumen:
-                            m_sel = proy['mejor_mercado']
-                        else:
-                            m_sel = proy['mercados_eval']['PTS']
+                    def procesar_jugadores_equipo_resumen(lista_top, abrev_eq, ajustes_eq, en_b2b_eq, def_rtg_op):
+                        for cand_j in lista_top:
+                            nom_j, pts_j, reb_j, ast_j, min_j, stat_j, id_j, df_j_full, df_j_prev = cand_j
+                            lineas_auto = calcular_lineas_automaticas_jugador(df_j_prev)
 
-                        tipo_m = m_sel['mercado']
-                        dir_m = m_sel['direccion']
-                        linea_m = m_sel['linea']
-                        lambda_m = m_sel['lambda']
-                        prob_m = m_sel['prob']
-                        edge_m = m_sel['edge']
-                        hr_m = m_sel['hit_rate']
-                        cv_m = m_sel['cv']
-                        estab_m = m_sel['estabilidad']
+                            aj = ajustes_eq.get(nom_j, {})
+                            min_aj_c5 = aj.get('min_ajustados', min_j)
+                            min_aj_ctx, _ = aplicar_ajustes_fatiga_y_paliza_minutos(
+                                min_aj_c5, en_b2b=en_b2b_eq, factor_recorte_paliza=factor_paliza_partido
+                            )
+                            bump = aj.get('factor_usage_bump', 1.0)
+                            min_eval = min_aj_ctx if usar_min_automaticos else min_proj_manual
 
-                        es_alta_conf = (prob_m >= UMBRAL_ALTA_CONFIANZA and edge_m >= 5.0 and hr_m >= 60.0 and "Volátil" not in estab_m)
+                            proy = calcular_proyeccion_jugador_capa2_3(
+                                df_jugador=df_j_prev,
+                                minutos_proyectados=min_eval,
+                                linea_pts=lineas_auto['pts'],
+                                linea_reb=lineas_auto['reb'],
+                                linea_ast=lineas_auto['ast'],
+                                linea_pra=lineas_auto['pra'],
+                                posesiones_partido=ctx_partido['posesiones_esperadas'],
+                                def_rtg_rival=def_rtg_op,
+                                promedios_liga=promedios_liga,
+                                factor_usage_bump=bump,
+                                min_base_sin_bajas=min_j,
+                                en_b2b=en_b2b_eq
+                            )
+                            if not proy:
+                                continue
 
-                        real_str = "-"
-                        desglose_str = "-"
-                        res_estado = "Pendiente"
+                            if "Mejor Mercado Auto" in modo_mercado_resumen:
+                                m_sel = proy['mejor_mercado']
+                            else:
+                                m_sel = proy['mercados_eval']['PTS']
 
-                        if partido_finalizado:
-                            partido_j_fecha = df_j_full[df_j_full['FECHA'] == fecha_busqueda_str]
-                            if not partido_j_fecha.empty and partido_j_fecha.iloc[0]['MIN'] > 0:
-                                p_r = int(partido_j_fecha.iloc[0]['PTS'])
-                                r_r = int(partido_j_fecha.iloc[0]['REB'])
-                                a_r = int(partido_j_fecha.iloc[0]['AST'])
-                                pra_r = p_r + r_r + a_r
-                                mapa_reales = {'PTS': p_r, 'REB': r_r, 'AST': a_r, 'PRA': pra_r}
-                                val_eval = mapa_reales[tipo_m]
-                                real_str = f"{val_eval} {tipo_m}"
-                                desglose_str = f"{p_r}P / {r_r}R / {a_r}A"
-                                res_estado = evaluar_resultado_linea(val_eval, linea_m, dir_m)
-                            elif datos_vivo_p:
-                                jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
-                                if jv and jv["MIN_ACTUAL"] > 0:
-                                    mapa_reales = {'PTS': jv['PTS_ACTUAL'], 'REB': jv['REB_ACTUAL'], 'AST': jv['AST_ACTUAL'], 'PRA': jv['PRA_ACTUAL']}
+                            tipo_m = m_sel['mercado']
+                            dir_m = m_sel['direccion']
+                            linea_m = m_sel['linea']
+                            lambda_m = m_sel['lambda']
+                            prob_m = m_sel['prob']
+                            edge_m = m_sel['edge']
+                            hr_m = m_sel['hit_rate']
+                            cv_m = m_sel['cv']
+                            estab_m = m_sel['estabilidad']
+
+                            es_alta_conf = (prob_m >= UMBRAL_ALTA_CONFIANZA and edge_m >= 5.0 and hr_m >= 60.0 and "Volátil" not in estab_m)
+
+                            real_str = "-"
+                            desglose_str = "-"
+                            res_estado = "Pendiente"
+
+                            if partido_finalizado:
+                                partido_j_fecha = df_j_full[df_j_full['FECHA'] == fecha_busqueda_str]
+                                if not partido_j_fecha.empty and partido_j_fecha.iloc[0]['MIN'] > 0:
+                                    p_r = int(partido_j_fecha.iloc[0]['PTS'])
+                                    r_r = int(partido_j_fecha.iloc[0]['REB'])
+                                    a_r = int(partido_j_fecha.iloc[0]['AST'])
+                                    pra_r = p_r + r_r + a_r
+                                    mapa_reales = {'PTS': p_r, 'REB': r_r, 'AST': a_r, 'PRA': pra_r}
                                     val_eval = mapa_reales[tipo_m]
                                     real_str = f"{val_eval} {tipo_m}"
-                                    desglose_str = f"{jv['PTS_ACTUAL']}P / {jv['REB_ACTUAL']}R / {jv['AST_ACTUAL']}A"
+                                    desglose_str = f"{p_r}P / {r_r}R / {a_r}A"
                                     res_estado = evaluar_resultado_linea(val_eval, linea_m, dir_m)
+                                elif datos_vivo_p:
+                                    jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
+                                    if jv and jv["MIN_ACTUAL"] > 0:
+                                        mapa_reales = {'PTS': jv['PTS_ACTUAL'], 'REB': jv['REB_ACTUAL'], 'AST': jv['AST_ACTUAL'], 'PRA': jv['PRA_ACTUAL']}
+                                        val_eval = mapa_reales[tipo_m]
+                                        real_str = f"{val_eval} {tipo_m}"
+                                        desglose_str = f"{jv['PTS_ACTUAL']}P / {jv['REB_ACTUAL']}R / {jv['AST_ACTUAL']}A"
+                                        res_estado = evaluar_resultado_linea(val_eval, linea_m, dir_m)
+                                    else:
+                                        res_estado = "No jugó"
                                 else:
                                     res_estado = "No jugó"
-                            else:
-                                res_estado = "No jugó"
 
-                        elif partido_en_vivo and datos_vivo_p:
-                            jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
-                            if jv:
-                                mapa_v = {'PTS': jv['PTS_ACTUAL'], 'REB': jv['REB_ACTUAL'], 'AST': jv['AST_ACTUAL'], 'PRA': jv['PRA_ACTUAL']}
-                                val_v = mapa_v[tipo_m]
-                                real_str = f"🔴 {val_v} {tipo_m} ({jv['MIN_ACTUAL']:.0f}m)"
-                                desglose_str = f"{jv['PTS_ACTUAL']}P / {jv['REB_ACTUAL']}R / {jv['AST_ACTUAL']}A"
-                                if dir_m == "MÁS" and val_v > linea_m:
-                                    res_estado = "🟢 Superada (Vivo)"
-                                elif dir_m == "MENOS" and val_v > linea_m:
-                                    res_estado = "🔴 Superada en contra"
-                                else:
-                                    res_estado = f"⏳ En juego ({partido['estado']})"
+                            elif partido_en_vivo and datos_vivo_p:
+                                jv = datos_vivo_p["jugadores_por_id"].get(str(id_j)) or datos_vivo_p["jugadores_por_nombre"].get(normalizar_texto(nom_j))
+                                if jv:
+                                    mapa_v = {'PTS': jv['PTS_ACTUAL'], 'REB': jv['REB_ACTUAL'], 'AST': jv['AST_ACTUAL'], 'PRA': jv['PRA_ACTUAL']}
+                                    val_v = mapa_v[tipo_m]
+                                    real_str = f"🔴 {val_v} {tipo_m} ({jv['MIN_ACTUAL']:.0f}m)"
+                                    desglose_str = f"{jv['PTS_ACTUAL']}P / {jv['REB_ACTUAL']}R / {jv['AST_ACTUAL']}A"
+                                    if dir_m == "MÁS" and val_v > linea_m:
+                                        res_estado = "🟢 Superada (Vivo)"
+                                    elif dir_m == "MENOS" and val_v > linea_m:
+                                        res_estado = "🔴 Superada en contra"
+                                    else:
+                                        res_estado = f"⏳ En juego ({partido['estado']})"
 
-                        resumen_jugadores.append({
-                            'Nivel': '🔥 TOP PICK' if es_alta_conf else 'Estándar',
+                            resumen_jugadores.append({
+                                'Nivel': '🔥 TOP PICK' if es_alta_conf else 'Estándar',
+                                'Encuentro': partido['encuentro'],
+                                'Jugador': nom_j,
+                                'Equipo': abrev_eq,
+                                'Mercado': tipo_m,
+                                'Min Proy.': round(min_eval, 1),
+                                'Λ Proy.': lambda_m,
+                                'Línea': linea_m,
+                                'Recomendación': f"{dir_m} {linea_m} {tipo_m}",
+                                'Prob.': f"{prob_m:.1f}%",
+                                'Edge %': f"{edge_m:+.1f}%",
+                                'Hit Rate L10': f"{int(hr_m)}%",
+                                'Estabilidad': f"{estab_m} ({cv_m}%)",
+                                'Real / Vivo': real_str,
+                                'Boxscore': desglose_str,
+                                'Resultado': res_estado,
+                                '_edge_num': edge_m,
+                                '_hr_num': hr_m,
+                                '_estab_txt': estab_m,
+                                '_score_calidad': m_sel['score_calidad']
+                            })
+
+                    procesar_jugadores_equipo_resumen(top_t1, partido['abrev_t1'], ajustes_t1, t1_b2b, ctx_partido['eq2_stats']['def_rtg'])
+                    procesar_jugadores_equipo_resumen(top_t2, partido['abrev_t2'], ajustes_t2, t2_b2b, ctx_partido['eq1_stats']['def_rtg'])
+                   
+                    col_p1, col_p2 = st.columns(2)
+                   
+                    with col_p1:
+                        if top_t1:
+                            nom_1, pts_1, reb_1, ast_1, min_1, stat_1, id_1, df_j1_full, df_j1_prev = top_t1[0]
+                            lineas_auto_1 = calcular_lineas_automaticas_jugador(df_j1_prev)
+                            aj_1 = ajustes_t1.get(nom_1, {})
+                            min_aj_ctx_1, notas_min_1 = aplicar_ajustes_fatiga_y_paliza_minutos(
+                                aj_1.get('min_ajustados', min_1), en_b2b=t1_b2b, factor_recorte_paliza=factor_paliza_partido
+                            )
+                            min_eval_1 = min_aj_ctx_1 if usar_min_automaticos else min_proj_manual
+                            proy_1 = calcular_proyeccion_jugador_capa2_3(
+                                df_jugador=df_j1_prev, minutos_proyectados=min_eval_1,
+                                linea_pts=lineas_auto_1['pts'], linea_reb=lineas_auto_1['reb'],
+                                linea_ast=lineas_auto_1['ast'], linea_pra=lineas_auto_1['pra'],
+                                posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq2_stats']['def_rtg'],
+                                promedios_liga=promedios_liga, factor_usage_bump=aj_1.get('factor_usage_bump', 1.0),
+                                min_base_sin_bajas=min_1, en_b2b=t1_b2b
+                            )
+                            mm1 = proy_1['mejor_mercado']
+                            etiqueta_extra_1 = f" | {', '.join(notas_min_1)}" if notas_min_1 else ""
+                            sello_exp_1 = f" 🔥 {mm1['direccion']} {mm1['linea']} {mm1['mercado']} (Edge {mm1['edge']:+.1f}%)" if mm1['edge'] >= 4.5 else ""
+                            with st.expander(f"⭐ {partido['abrev_t1']} - {nom_1} (PTS Λ: {proy_1['lambda_pts']:.1f} vs {lineas_auto_1['pts']}{etiqueta_extra_1}){sello_exp_1}"):
+                                st.markdown(obtener_html_badge_confianza(mm1['prob']), unsafe_allow_html=True)
+                                st.markdown(
+                                    f"**Mejor Mercado:** `{mm1['direccion']} {mm1['linea']} {mm1['mercado']}` (Λ: {mm1['lambda']}) | "
+                                    f"**Hit Rate L10:** {int(mm1['hit_rate'])}% | **Estabilidad:** {mm1['estabilidad']}"
+                                )
+                                st.metric(
+                                    f"Proyección Completa ({lineas_auto_1['pts']}P / {lineas_auto_1['reb']}R / {lineas_auto_1['ast']}A / {lineas_auto_1['pra']} PRA)",
+                                    f"{proy_1['lambda_pts']:.1f} P | {proy_1['lambda_reb']:.1f} R | {proy_1['lambda_ast']:.1f} A | {proy_1['lambda_pra']:.1f} PRA"
+                                )
+                                if st.button(f"Analizar a {nom_1} en Vivo / Detalle", key=f"btn_{id_1}_{partido['event_id']}"):
+                                    st.session_state['jugador_seleccionado'] = nom_1
+                                    st.rerun()
+                        else:
+                            st.info(f"Sin jugadores sanos activos para {partido['abrev_t1']}")
+
+                    with col_p2:
+                        if top_t2:
+                            nom_2, pts_2, reb_2, ast_2, min_2, stat_2, id_2, df_j2_full, df_j2_prev = top_t2[0]
+                            lineas_auto_2 = calcular_lineas_automaticas_jugador(df_j2_prev)
+                            aj_2 = ajustes_t2.get(nom_2, {})
+                            min_aj_ctx_2, notas_min_2 = aplicar_ajustes_fatiga_y_paliza_minutos(
+                                aj_2.get('min_ajustados', min_2), en_b2b=t2_b2b, factor_recorte_paliza=factor_paliza_partido
+                            )
+                            min_eval_2 = min_aj_ctx_2 if usar_min_automaticos else min_proj_manual
+                            proy_2 = calcular_proyeccion_jugador_capa2_3(
+                                df_jugador=df_j2_prev, minutos_proyectados=min_eval_2,
+                                linea_pts=lineas_auto_2['pts'], linea_reb=lineas_auto_2['reb'],
+                                linea_ast=lineas_auto_2['ast'], linea_pra=lineas_auto_2['pra'],
+                                posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq1_stats']['def_rtg'],
+                                promedios_liga=promedios_liga, factor_usage_bump=aj_2.get('factor_usage_bump', 1.0),
+                                min_base_sin_bajas=min_2, en_b2b=t2_b2b
+                            )
+                            mm2 = proy_2['mejor_mercado']
+                            etiqueta_extra_2 = f" | {', '.join(notas_min_2)}" if notas_min_2 else ""
+                            sello_exp_2 = f" 🔥 {mm2['direccion']} {mm2['linea']} {mm2['mercado']} (Edge {mm2['edge']:+.1f}%)" if mm2['edge'] >= 4.5 else ""
+                            with st.expander(f"⭐ {partido['abrev_t2']} - {nom_2} (PTS Λ: {proy_2['lambda_pts']:.1f} vs {lineas_auto_2['pts']}{etiqueta_extra_2}){sello_exp_2}"):
+                                st.markdown(obtener_html_badge_confianza(mm2['prob']), unsafe_allow_html=True)
+                                st.markdown(
+                                    f"**Mejor Mercado:** `{mm2['direccion']} {mm2['linea']} {mm2['mercado']}` (Λ: {mm2['lambda']}) | "
+                                    f"**Hit Rate L10:** {int(mm2['hit_rate'])}% | **Estabilidad:** {mm2['estabilidad']}"
+                                )
+                                st.metric(
+                                    f"Proyección Completa ({lineas_auto_2['pts']}P / {lineas_auto_2['reb']}R / {lineas_auto_2['ast']}A / {lineas_auto_2['pra']} PRA)",
+                                    f"{proy_2['lambda_pts']:.1f} P | {proy_2['lambda_reb']:.1f} R | {proy_2['lambda_ast']:.1f} A | {proy_2['lambda_pra']:.1f} PRA"
+                                )
+                                if st.button(f"Analizar a {nom_2} en Vivo / Detalle", key=f"btn_{id_2}_{partido['event_id']}"):
+                                    st.session_state['jugador_seleccionado'] = nom_2
+                                    st.rerun()
+                        else:
+                            st.info(f"Sin jugadores sanos activos para {partido['abrev_t2']}")
+                   
+                    prob_t1 = ctx_partido['prob_t1']
+                    prob_t2 = ctx_partido['prob_t2']
+                    total_proyectado_partido = ctx_partido['total_proyectado']
+                    is_more_partido = total_proyectado_partido > linea_ou_partido
+                    verdict_partido_total = "MÁS" if is_more_partido else "MENOS"
+                    prob_total_rec = ctx_partido['prob_over_total'] if is_more_partido else (100.0 - ctx_partido['prob_over_total'])
+                    ganador_recomendado = partido['abrev_t1'] if prob_t1 >= prob_t2 else partido['abrev_t2']
+                    max_prob_val = max(prob_t1, prob_t2)
+                    edge_ml = round(max_prob_val - BREAK_EVEN_ODDS_110, 1)
+                    edge_ou = round(prob_total_rec - BREAK_EVEN_ODDS_110, 1)
+
+                    clasif_eq = clasificar_oportunidad_partido(
+                        abrev_ganador=ganador_recomendado,
+                        edge_ml=edge_ml,
+                        dir_total=verdict_partido_total,
+                        linea_ou=linea_ou_partido,
+                        edge_ou=edge_ou,
+                        umbral_edge=UMBRAL_EDGE_OPERABLE
+                    )
+
+                    ganador_display = (
+                        f"{ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%)"
+                        if clasif_eq['ml_valido']
+                        else f"⚠️ {ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}% - Sin Edge)"
+                    )
+                    total_display = (
+                        f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)"
+                        if clasif_eq['ou_valido']
+                        else f"⚠️ {verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}% - Ruido)"
+                    )
+
+                    s1 = partido['score_t1']
+                    s2 = partido['score_t2']
+                    total_actual = s1 + s2
+
+                    if partido_finalizado:
+                        ganador_real = partido['abrev_t1'] if s1 > s2 else partido['abrev_t2']
+                        cumplio_total = evaluar_resultado_linea(total_actual, linea_ou_partido, verdict_partido_total)
+                        acerto_ganador = "🟢 Acierto" if ganador_recomendado == ganador_real else "🔴 Fallo"
+                       
+                        resumen_equipos.append({
+                            'Nivel': clasif_eq['nivel'],
+                            'Mercado Operable': clasif_eq['mercado_operable'],
+                            'Hora (ECT)': partido['hora_ecuador'],
                             'Encuentro': partido['encuentro'],
-                            'Jugador': nom_j,
-                            'Equipo': abrev_eq,
-                            'Mercado': tipo_m,
-                            'Min Proy.': round(min_eval, 1),
-                            'Λ Proy.': lambda_m,
-                            'Línea': linea_m,
-                            'Recomendación': f"{dir_m} {linea_m} {tipo_m}",
-                            'Prob.': f"{prob_m:.1f}%",
-                            'Edge %': f"{edge_m:+.1f}%",
-                            'Hit Rate L10': f"{int(hr_m)}%",
-                            'Estabilidad': f"{estab_m} ({cv_m}%)",
-                            'Real / Vivo': real_str,
-                            'Boxscore': desglose_str,
-                            'Resultado': res_estado,
-                            '_edge_num': edge_m,
-                            '_hr_num': hr_m,
-                            '_estab_txt': estab_m,
-                            '_score_calidad': m_sel['score_calidad']
+                            'Marcador': f"🏁 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
+                            'Ganador Sugerido': ganador_display,
+                            'Resultado Ganador': acerto_ganador if clasif_eq['ml_valido'] else f"No operable ({acerto_ganador})",
+                            'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
+                            'Pts Proyectados': total_proyectado_partido,
+                            'Predicción Total': total_display,
+                            'Total Real / Vivo': f"{total_actual} pts",
+                            'Resultado Total': cumplio_total if clasif_eq['ou_valido'] else f"No operable ({cumplio_total})",
+                            'Estado': 'Finalizado',
+                            '_ml_valido': clasif_eq['ml_valido'],
+                            '_ou_valido': clasif_eq['ou_valido'],
+                            '_es_operable': clasif_eq['es_operable'],
+                            '_score_orden': clasif_eq['score_orden']
                         })
 
-                procesar_jugadores_equipo_resumen(top_t1, partido['abrev_t1'], ajustes_t1, t1_b2b, ctx_partido['eq2_stats']['def_rtg'])
-                procesar_jugadores_equipo_resumen(top_t2, partido['abrev_t2'], ajustes_t2, t2_b2b, ctx_partido['eq1_stats']['def_rtg'])
-               
-                col_p1, col_p2 = st.columns(2)
-               
-                with col_p1:
-                    if top_t1:
-                        nom_1, pts_1, reb_1, ast_1, min_1, stat_1, id_1, df_j1_full, df_j1_prev = top_t1[0]
-                        lineas_auto_1 = calcular_lineas_automaticas_jugador(df_j1_prev)
-                        aj_1 = ajustes_t1.get(nom_1, {})
-                        min_aj_ctx_1, notas_min_1 = aplicar_ajustes_fatiga_y_paliza_minutos(
-                            aj_1.get('min_ajustados', min_1), en_b2b=t1_b2b, factor_recorte_paliza=factor_paliza_partido
-                        )
-                        min_eval_1 = min_aj_ctx_1 if usar_min_automaticos else min_proj_manual
-                        proy_1 = calcular_proyeccion_jugador_capa2_3(
-                            df_jugador=df_j1_prev, minutos_proyectados=min_eval_1,
-                            linea_pts=lineas_auto_1['pts'], linea_reb=lineas_auto_1['reb'],
-                            linea_ast=lineas_auto_1['ast'], linea_pra=lineas_auto_1['pra'],
-                            posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq2_stats']['def_rtg'],
-                            promedios_liga=promedios_liga, factor_usage_bump=aj_1.get('factor_usage_bump', 1.0),
-                            min_base_sin_bajas=min_1, en_b2b=t1_b2b
-                        )
-                        mm1 = proy_1['mejor_mercado']
-                        etiqueta_extra_1 = f" | {', '.join(notas_min_1)}" if notas_min_1 else ""
-                        sello_exp_1 = f" 🔥 {mm1['direccion']} {mm1['linea']} {mm1['mercado']} (Edge {mm1['edge']:+.1f}%)" if mm1['edge'] >= 4.5 else ""
-                        with st.expander(f"⭐ {partido['abrev_t1']} - {nom_1} (PTS Λ: {proy_1['lambda_pts']:.1f} vs {lineas_auto_1['pts']}{etiqueta_extra_1}){sello_exp_1}"):
-                            st.markdown(obtener_html_badge_confianza(mm1['prob']), unsafe_allow_html=True)
+                        st.info(f"📊 **Resultado Final Real:** {partido['abrev_t1']} **{s1} - {s2}** {partido['abrev_t2']} (Total: {total_actual} pts)")
+                        col_res1, col_res2 = st.columns(2)
+                        with col_res1:
+                            st.markdown(f"**Ganador:** {ganador_display} | **Real:** {ganador_real} → {acerto_ganador}")
+                        with col_res2:
                             st.markdown(
-                                f"**Mejor Mercado:** `{mm1['direccion']} {mm1['linea']} {mm1['mercado']}` (Λ: {mm1['lambda']}) | "
-                                f"**Hit Rate L10:** {int(mm1['hit_rate'])}% | **Estabilidad:** {mm1['estabilidad']}"
+                                f"**Total Partido ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} "
+                                f"({total_display}) | Real: **{total_actual}** → {cumplio_total}"
                             )
-                            st.metric(
-                                f"Proyección Completa ({lineas_auto_1['pts']}P / {lineas_auto_1['reb']}R / {lineas_auto_1['ast']}A / {lineas_auto_1['pra']} PRA)",
-                                f"{proy_1['lambda_pts']:.1f} P | {proy_1['lambda_reb']:.1f} R | {proy_1['lambda_ast']:.1f} A | {proy_1['lambda_pra']:.1f} PRA"
-                            )
-                            if st.button(f"Analizar a {nom_1} en Vivo / Detalle", key=f"btn_{id_1}_{partido['event_id']}"):
-                                st.session_state['jugador_seleccionado'] = nom_1
-                                st.rerun()
+                    elif partido_en_vivo:
+                        lider_actual = partido['abrev_t1'] if s1 > s2 else (partido['abrev_t2'] if s2 > s1 else "Empate")
+                        estado_ganador_vivo = "🟢 Liderando" if lider_actual == ganador_recomendado else ("🟡 Empatado" if lider_actual == "Empate" else "🔴 Abajo")
+
+                        resumen_equipos.append({
+                            'Nivel': clasif_eq['nivel'],
+                            'Mercado Operable': clasif_eq['mercado_operable'],
+                            'Hora (ECT)': partido['hora_ecuador'],
+                            'Encuentro': partido['encuentro'],
+                            'Marcador': f"🔴 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
+                            'Ganador Sugerido': ganador_display,
+                            'Resultado Ganador': estado_ganador_vivo,
+                            'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
+                            'Pts Proyectados': total_proyectado_partido,
+                            'Predicción Total': total_display,
+                            'Total Real / Vivo': f"🔴 {total_actual} pts",
+                            'Resultado Total': f"⏳ {partido['estado']}",
+                            'Estado': f"🔴 {partido['estado']}",
+                            '_ml_valido': clasif_eq['ml_valido'],
+                            '_ou_valido': clasif_eq['ou_valido'],
+                            '_es_operable': clasif_eq['es_operable'],
+                            '_score_orden': clasif_eq['score_orden']
+                        })
+
+                        col_r1, col_r2 = st.columns(2)
+                        with col_r1:
+                            if clasif_eq['ml_valido']:
+                                st.success(f"🏆 **Ganador Operable:** **{ganador_display}** | Vivo: **{estado_ganador_vivo}**")
+                            else:
+                                st.info(f"⚖️ **Ganador Sin Edge:** {ganador_display} | Vivo: **{estado_ganador_vivo}**")
+                        with col_r2:
+                            if clasif_eq['ou_valido']:
+                                st.warning(f"📈 **Total Operable ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}** | Acumulado: **{total_actual} pts**")
+                            else:
+                                st.info(f"⚖️ **Total Sin Edge ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display} | Acumulado: **{total_actual} pts**")
                     else:
-                        st.info(f"Sin jugadores sanos activos para {partido['abrev_t1']}")
+                        resumen_equipos.append({
+                            'Nivel': clasif_eq['nivel'],
+                            'Mercado Operable': clasif_eq['mercado_operable'],
+                            'Hora (ECT)': partido['hora_ecuador'],
+                            'Encuentro': partido['encuentro'],
+                            'Marcador': '-',
+                            'Ganador Sugerido': ganador_display,
+                            'Resultado Ganador': 'Pendiente' if clasif_eq['ml_valido'] else 'No operar',
+                            'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
+                            'Pts Proyectados': total_proyectado_partido,
+                            'Predicción Total': total_display,
+                            'Total Real / Vivo': '-',
+                            'Resultado Total': 'Pendiente' if clasif_eq['ou_valido'] else 'No operar',
+                            'Estado': partido['estado'],
+                            '_ml_valido': clasif_eq['ml_valido'],
+                            '_ou_valido': clasif_eq['ou_valido'],
+                            '_es_operable': clasif_eq['es_operable'],
+                            '_score_orden': clasif_eq['score_orden']
+                        })
 
-                with col_p2:
-                    if top_t2:
-                        nom_2, pts_2, reb_2, ast_2, min_2, stat_2, id_2, df_j2_full, df_j2_prev = top_t2[0]
-                        lineas_auto_2 = calcular_lineas_automaticas_jugador(df_j2_prev)
-                        aj_2 = ajustes_t2.get(nom_2, {})
-                        min_aj_ctx_2, notas_min_2 = aplicar_ajustes_fatiga_y_paliza_minutos(
-                            aj_2.get('min_ajustados', min_2), en_b2b=t2_b2b, factor_recorte_paliza=factor_paliza_partido
-                        )
-                        min_eval_2 = min_aj_ctx_2 if usar_min_automaticos else min_proj_manual
-                        proy_2 = calcular_proyeccion_jugador_capa2_3(
-                            df_jugador=df_j2_prev, minutos_proyectados=min_eval_2,
-                            linea_pts=lineas_auto_2['pts'], linea_reb=lineas_auto_2['reb'],
-                            linea_ast=lineas_auto_2['ast'], linea_pra=lineas_auto_2['pra'],
-                            posesiones_partido=ctx_partido['posesiones_esperadas'], def_rtg_rival=ctx_partido['eq1_stats']['def_rtg'],
-                            promedios_liga=promedios_liga, factor_usage_bump=aj_2.get('factor_usage_bump', 1.0),
-                            min_base_sin_bajas=min_2, en_b2b=t2_b2b
-                        )
-                        mm2 = proy_2['mejor_mercado']
-                        etiqueta_extra_2 = f" | {', '.join(notas_min_2)}" if notas_min_2 else ""
-                        sello_exp_2 = f" 🔥 {mm2['direccion']} {mm2['linea']} {mm2['mercado']} (Edge {mm2['edge']:+.1f}%)" if mm2['edge'] >= 4.5 else ""
-                        with st.expander(f"⭐ {partido['abrev_t2']} - {nom_2} (PTS Λ: {proy_2['lambda_pts']:.1f} vs {lineas_auto_2['pts']}{etiqueta_extra_2}){sello_exp_2}"):
-                            st.markdown(obtener_html_badge_confianza(mm2['prob']), unsafe_allow_html=True)
-                            st.markdown(
-                                f"**Mejor Mercado:** `{mm2['direccion']} {mm2['linea']} {mm2['mercado']}` (Λ: {mm2['lambda']}) | "
-                                f"**Hit Rate L10:** {int(mm2['hit_rate'])}% | **Estabilidad:** {mm2['estabilidad']}"
-                            )
-                            st.metric(
-                                f"Proyección Completa ({lineas_auto_2['pts']}P / {lineas_auto_2['reb']}R / {lineas_auto_2['ast']}A / {lineas_auto_2['pra']} PRA)",
-                                f"{proy_2['lambda_pts']:.1f} P | {proy_2['lambda_reb']:.1f} R | {proy_2['lambda_ast']:.1f} A | {proy_2['lambda_pra']:.1f} PRA"
-                            )
-                            if st.button(f"Analizar a {nom_2} en Vivo / Detalle", key=f"btn_{id_2}_{partido['event_id']}"):
-                                st.session_state['jugador_seleccionado'] = nom_2
-                                st.rerun()
-                    else:
-                        st.info(f"Sin jugadores sanos activos para {partido['abrev_t2']}")
-               
-                prob_t1 = ctx_partido['prob_t1']
-                prob_t2 = ctx_partido['prob_t2']
-                total_proyectado_partido = ctx_partido['total_proyectado']
-                is_more_partido = total_proyectado_partido > linea_ou_partido
-                verdict_partido_total = "MÁS" if is_more_partido else "MENOS"
-                prob_total_rec = ctx_partido['prob_over_total'] if is_more_partido else (100.0 - ctx_partido['prob_over_total'])
-                ganador_recomendado = partido['abrev_t1'] if prob_t1 >= prob_t2 else partido['abrev_t2']
-                max_prob_val = max(prob_t1, prob_t2)
-                edge_ml = round(max_prob_val - BREAK_EVEN_ODDS_110, 1)
-                edge_ou = round(prob_total_rec - BREAK_EVEN_ODDS_110, 1)
+                        col_r1, col_r2 = st.columns(2)
+                        with col_r1:
+                            if clasif_eq['ml_valido']:
+                                st.success(f"🏆 **Ganador Operable (Moneyline):** **{ganador_display}**")
+                            else:
+                                st.info(f"⚖️ **Ganador Descartado:** {ganador_display}")
+                        with col_r2:
+                            if clasif_eq['ou_valido']:
+                                st.warning(f"📈 **Total Operable ({linea_ou_partido} - {origen_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}**")
+                            else:
+                                st.info(f"⚖️ **Total Descartado ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display}")
 
-                clasif_eq = clasificar_oportunidad_partido(
-                    abrev_ganador=ganador_recomendado,
-                    edge_ml=edge_ml,
-                    dir_total=verdict_partido_total,
-                    linea_ou=linea_ou_partido,
-                    edge_ou=edge_ou,
-                    umbral_edge=UMBRAL_EDGE_OPERABLE
-                )
-
-                ganador_display = (
-                    f"{ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%)"
-                    if clasif_eq['ml_valido']
-                    else f"⚠️ {ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}% - Sin Edge)"
-                )
-                total_display = (
-                    f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)"
-                    if clasif_eq['ou_valido']
-                    else f"⚠️ {verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}% - Ruido)"
-                )
-
-                s1 = partido['score_t1']
-                s2 = partido['score_t2']
-                total_actual = s1 + s2
-
-                if partido_finalizado:
-                    ganador_real = partido['abrev_t1'] if s1 > s2 else partido['abrev_t2']
-                    cumplio_total = evaluar_resultado_linea(total_actual, linea_ou_partido, verdict_partido_total)
-                    acerto_ganador = "🟢 Acierto" if ganador_recomendado == ganador_real else "🔴 Fallo"
-                   
-                    resumen_equipos.append({
-                        'Nivel': clasif_eq['nivel'],
-                        'Mercado Operable': clasif_eq['mercado_operable'],
-                        'Hora (ECT)': partido['hora_ecuador'],
-                        'Encuentro': partido['encuentro'],
-                        'Marcador': f"🏁 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
-                        'Ganador Sugerido': ganador_display,
-                        'Resultado Ganador': acerto_ganador if clasif_eq['ml_valido'] else f"No operable ({acerto_ganador})",
-                        'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
-                        'Pts Proyectados': total_proyectado_partido,
-                        'Predicción Total': total_display,
-                        'Total Real / Vivo': f"{total_actual} pts",
-                        'Resultado Total': cumplio_total if clasif_eq['ou_valido'] else f"No operable ({cumplio_total})",
-                        'Estado': 'Finalizado',
-                        '_ml_valido': clasif_eq['ml_valido'],
-                        '_ou_valido': clasif_eq['ou_valido'],
-                        '_es_operable': clasif_eq['es_operable'],
-                        '_score_orden': clasif_eq['score_orden']
-                    })
-
-                    st.info(f"📊 **Resultado Final Real:** {partido['abrev_t1']} **{s1} - {s2}** {partido['abrev_t2']} (Total: {total_actual} pts)")
-                    col_res1, col_res2 = st.columns(2)
-                    with col_res1:
-                        st.markdown(f"**Ganador:** {ganador_display} | **Real:** {ganador_real} → {acerto_ganador}")
-                    with col_res2:
-                        st.markdown(
-                            f"**Total Partido ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} "
-                            f"({total_display}) | Real: **{total_actual}** → {cumplio_total}"
-                        )
-                elif partido_en_vivo:
-                    lider_actual = partido['abrev_t1'] if s1 > s2 else (partido['abrev_t2'] if s2 > s1 else "Empate")
-                    estado_ganador_vivo = "🟢 Liderando" if lider_actual == ganador_recomendado else ("🟡 Empatado" if lider_actual == "Empate" else "🔴 Abajo")
-
-                    resumen_equipos.append({
-                        'Nivel': clasif_eq['nivel'],
-                        'Mercado Operable': clasif_eq['mercado_operable'],
-                        'Hora (ECT)': partido['hora_ecuador'],
-                        'Encuentro': partido['encuentro'],
-                        'Marcador': f"🔴 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
-                        'Ganador Sugerido': ganador_display,
-                        'Resultado Ganador': estado_ganador_vivo,
-                        'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
-                        'Pts Proyectados': total_proyectado_partido,
-                        'Predicción Total': total_display,
-                        'Total Real / Vivo': f"🔴 {total_actual} pts",
-                        'Resultado Total': f"⏳ {partido['estado']}",
-                        'Estado': f"🔴 {partido['estado']}",
-                        '_ml_valido': clasif_eq['ml_valido'],
-                        '_ou_valido': clasif_eq['ou_valido'],
-                        '_es_operable': clasif_eq['es_operable'],
-                        '_score_orden': clasif_eq['score_orden']
-                    })
-
-                    col_r1, col_r2 = st.columns(2)
-                    with col_r1:
-                        if clasif_eq['ml_valido']:
-                            st.success(f"🏆 **Ganador Operable:** **{ganador_display}** | Vivo: **{estado_ganador_vivo}**")
-                        else:
-                            st.info(f"⚖️ **Ganador Sin Edge:** {ganador_display} | Vivo: **{estado_ganador_vivo}**")
-                    with col_r2:
-                        if clasif_eq['ou_valido']:
-                            st.warning(f"📈 **Total Operable ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}** | Acumulado: **{total_actual} pts**")
-                        else:
-                            st.info(f"⚖️ **Total Sin Edge ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display} | Acumulado: **{total_actual} pts**")
-                else:
-                    resumen_equipos.append({
-                        'Nivel': clasif_eq['nivel'],
-                        'Mercado Operable': clasif_eq['mercado_operable'],
-                        'Hora (ECT)': partido['hora_ecuador'],
-                        'Encuentro': partido['encuentro'],
-                        'Marcador': '-',
-                        'Ganador Sugerido': ganador_display,
-                        'Resultado Ganador': 'Pendiente' if clasif_eq['ml_valido'] else 'No operar',
-                        'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
-                        'Pts Proyectados': total_proyectado_partido,
-                        'Predicción Total': total_display,
-                        'Total Real / Vivo': '-',
-                        'Resultado Total': 'Pendiente' if clasif_eq['ou_valido'] else 'No operar',
-                        'Estado': partido['estado'],
-                        '_ml_valido': clasif_eq['ml_valido'],
-                        '_ou_valido': clasif_eq['ou_valido'],
-                        '_es_operable': clasif_eq['es_operable'],
-                        '_score_orden': clasif_eq['score_orden']
-                    })
-
-                    col_r1, col_r2 = st.columns(2)
-                    with col_r1:
-                        if clasif_eq['ml_valido']:
-                            st.success(f"🏆 **Ganador Operable (Moneyline):** **{ganador_display}**")
-                        else:
-                            st.info(f"⚖️ **Ganador Descartado:** {ganador_display}")
-                    with col_r2:
-                        if clasif_eq['ou_valido']:
-                            st.warning(f"📈 **Total Operable ({linea_ou_partido} - {origen_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}**")
-                        else:
-                            st.info(f"⚖️ **Total Descartado ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display}")
-
-                renderizar_barra_probabilidad_dual(partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2)
-                st.markdown("---")
-    else:
-        st.info(f"No hay partidos registrados en la cartelera oficial para la fecha: {fecha_seleccionada}.")
-
-    # --- RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES ---
-    if resumen_equipos:
-        st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Clasificados por Edge Real)")
-        st.markdown(
-            f"Separa automáticamente **💎 Doble Edge**, **🎯 Edge Solo Total (O/U)** y **🏆 Edge Solo Ganador (ML)** "
-            f"(umbral mínimo **Edge ≥ +{UMBRAL_EDGE_OPERABLE:.1f}%**)."
-        )
-       
-        df_equipos = pd.DataFrame(resumen_equipos)
-        df_equipos = df_equipos.sort_values(by='_score_orden', ascending=False)
-
-        if "Doble Edge" in filtro_equipos_modo:
-            df_equipos = df_equipos[df_equipos['_ml_valido'] & df_equipos['_ou_valido']]
-        elif "Solo Total" in filtro_equipos_modo:
-            df_equipos = df_equipos[df_equipos['_ou_valido']]
-        elif "Solo Ganador" in filtro_equipos_modo:
-            df_equipos = df_equipos[df_equipos['_ml_valido']]
-        elif "Solo Partidos Operables" in filtro_equipos_modo:
-            df_equipos = df_equipos[df_equipos['_es_operable']]
-
-        cols_ocultas_eq = ['_ml_valido', '_ou_valido', '_es_operable', '_score_orden']
-        df_equipos_export = df_equipos.drop(columns=cols_ocultas_eq, errors='ignore').copy()
-        if not df_equipos_export.empty:
-            csv_equipos = df_equipos_export.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Descargar Resumen de Partidos (CSV)",
-                data=csv_equipos,
-                file_name=f"nba_equipos_{fecha_seleccionada}.csv",
-                mime="text/csv",
-            )
-            st.dataframe(df_equipos_export, use_container_width=True, hide_index=True)
+                    renderizar_barra_probabilidad_dual(partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2)
+                    st.markdown("---")
         else:
-            st.info("Ningún encuentro cumple el filtro seleccionado en el sidebar.")
-        st.markdown("---")
+            st.info(f"No hay partidos registrados en la cartelera oficial para la fecha: {fecha_seleccionada}.")
 
-    if resumen_jugadores:
-        st.subheader("⭐ Resumen Ejecutivo: Mejores Mercados de Jugadores (Ordenados por Calidad)")
-        st.markdown(
-            "Ordenado automáticamente de **mayor a menor calidad estadística** combinando **Edge %**, **Hit Rate L10** y **Estabilidad (CV%)**."
-        )
-       
-        df_jugadores_res = pd.DataFrame(resumen_jugadores)
-        df_jugadores_res = df_jugadores_res.sort_values(by='_score_calidad', ascending=False)
-
-        if aplicar_filtros_calidad:
-            df_jugadores_res = df_jugadores_res[
-                (df_jugadores_res['_edge_num'] >= min_edge_filtro) &
-                (df_jugadores_res['_hr_num'] >= min_hit_rate_filtro)
-            ]
-            if excluir_volatiles:
-                df_jugadores_res = df_jugadores_res[~df_jugadores_res['_estab_txt'].str.contains("Volátil", na=False)]
-
-        cols_ocultas = ['_edge_num', '_hr_num', '_estab_txt', '_score_calidad']
-        df_jugadores_export = df_jugadores_res.drop(columns=cols_ocultas, errors='ignore').copy()
-
-        if not df_jugadores_export.empty:
-            csv_jugadores = df_jugadores_export.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Descargar Resumen de Jugadores (CSV)",
-                data=csv_jugadores,
-                file_name=f"nba_jugadores_{fecha_seleccionada}.csv",
-                mime="text/csv",
+        # --- RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES ---
+        if resumen_equipos:
+            st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Clasificados por Edge Real)")
+            st.markdown(
+                f"Separa automáticamente **💎 Doble Edge**, **🎯 Edge Solo Total (O/U)** y **🏆 Edge Solo Ganador (ML)** "
+                f"(umbral mínimo **Edge ≥ +{UMBRAL_EDGE_OPERABLE:.1f}%**)."
             )
-            st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True)
+           
+            df_equipos = pd.DataFrame(resumen_equipos)
+            df_equipos = df_equipos.sort_values(by='_score_orden', ascending=False)
+
+            if "Doble Edge" in filtro_equipos_modo:
+                df_equipos = df_equipos[df_equipos['_ml_valido'] & df_equipos['_ou_valido']]
+            elif "Solo Total" in filtro_equipos_modo:
+                df_equipos = df_equipos[df_equipos['_ou_valido']]
+            elif "Solo Ganador" in filtro_equipos_modo:
+                df_equipos = df_equipos[df_equipos['_ml_valido']]
+            elif "Solo Partidos Operables" in filtro_equipos_modo:
+                df_equipos = df_equipos[df_equipos['_es_operable']]
+
+            cols_ocultas_eq = ['_ml_valido', '_ou_valido', '_es_operable', '_score_orden']
+            df_equipos_export = df_equipos.drop(columns=cols_ocultas_eq, errors='ignore').copy()
+            if not df_equipos_export.empty:
+                csv_equipos = df_equipos_export.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Descargar Resumen de Partidos (CSV)",
+                    data=csv_equipos,
+                    file_name=f"nba_equipos_{fecha_seleccionada}.csv",
+                    mime="text/csv",
+                )
+                st.dataframe(df_equipos_export, use_container_width=True, hide_index=True)
+            else:
+                st.info("Ningún encuentro cumple el filtro seleccionado en el sidebar.")
+            st.markdown("---")
+
+        if resumen_jugadores:
+            st.subheader("⭐ Resumen Ejecutivo: Mejores Mercados de Jugadores (Ordenados por Calidad)")
+            st.markdown(
+                "Ordenado automáticamente de **mayor a menor calidad estadística** combinando **Edge %**, **Hit Rate L10** y **Estabilidad (CV%)**."
+            )
+           
+            df_jugadores_res = pd.DataFrame(resumen_jugadores)
+            df_jugadores_res = df_jugadores_res.sort_values(by='_score_calidad', ascending=False)
+
+            if aplicar_filtros_calidad:
+                df_jugadores_res = df_jugadores_res[
+                    (df_jugadores_res['_edge_num'] >= min_edge_filtro) &
+                    (df_jugadores_res['_hr_num'] >= min_hit_rate_filtro)
+                ]
+                if excluir_volatiles:
+                    df_jugadores_res = df_jugadores_res[~df_jugadores_res['_estab_txt'].str.contains("Volátil", na=False)]
+
+            cols_ocultas = ['_edge_num', '_hr_num', '_estab_txt', '_score_calidad']
+            df_jugadores_export = df_jugadores_res.drop(columns=cols_ocultas, errors='ignore').copy()
+
+            if not df_jugadores_export.empty:
+                csv_jugadores = df_jugadores_export.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Descargar Resumen de Jugadores (CSV)",
+                    data=csv_jugadores,
+                    file_name=f"nba_jugadores_{fecha_seleccionada}.csv",
+                    mime="text/csv",
+                )
+                st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True)
+            else:
+                st.info("Ningún jugador cumple los filtros estrictos de calidad seleccionados en el sidebar. Prueba bajar el Edge Mínimo o desactivar el filtro.")
+            st.markdown("---")
+
+        # --- ANÁLISIS DETALLADO DEL JUGADOR ---
+        if 'jugador_seleccionado' in st.session_state and st.session_state['jugador_seleccionado'] in nombres_disponibles:
+            jugador_activo = st.session_state['jugador_seleccionado']
+        elif jugador_seleccionado != "-- Selecciona un jugador --":
+            jugador_activo = jugador_seleccionado
         else:
-            st.info("Ningún jugador cumple los filtros estrictos de calidad seleccionados en el sidebar. Prueba bajar el Edge Mínimo o desactivar el filtro.")
-        st.markdown("---")
+            jugador_activo = None
 
-    # --- ANÁLISIS DETALLADO DEL JUGADOR ---
-    if 'jugador_seleccionado' in st.session_state and st.session_state['jugador_seleccionado'] in nombres_disponibles:
-        jugador_activo = st.session_state['jugador_seleccionado']
-    elif jugador_seleccionado != "-- Selecciona un jugador --":
-        jugador_activo = jugador_seleccionado
-    else:
-        jugador_activo = None
+        if jugador_activo:
+            info_sel = catalogo_jugadores[jugador_activo]
+            id_seleccionado = str(info_sel['id'])
+            equipo_jugador = info_sel['team_name']
+            team_id_jugador = str(info_sel['team_id'])
 
-    if jugador_activo:
-        info_sel = catalogo_jugadores[jugador_activo]
-        id_seleccionado = str(info_sel['id'])
-        equipo_jugador = info_sel['team_name']
-        team_id_jugador = str(info_sel['team_id'])
+            evento_jugador = next(
+                (p for p in cartelera_actual if team_id_jugador in (str(p["id_t1"]), str(p["id_t2"]))),
+                None
+            )
+            datos_vivo_ev = obtener_datos_en_vivo_espn(evento_jugador["event_id"]) if evento_jugador else None
 
-        evento_jugador = next(
-            (p for p in cartelera_fecha if team_id_jugador in (str(p["id_t1"]), str(p["id_t2"]))),
-            None
-        )
-        datos_vivo_ev = obtener_datos_en_vivo_espn(evento_jugador["event_id"]) if evento_jugador else None
+            ajustes_eq_jugador, bajas_eq_jugador = obtener_ajustes_equipo_cached(
+                team_id_jugador,
+                evento_jugador.get('bajas_evento_ids') if evento_jugador else None,
+                evento_jugador.get('bajas_evento_nombres') if evento_jugador else None,
+                datos_vivo_ev
+            )
+            ajuste_indiv_capa5 = ajustes_eq_jugador.get(jugador_activo, {})
 
-        ajustes_eq_jugador, bajas_eq_jugador = obtener_ajustes_equipo_cached(
-            team_id_jugador,
-            evento_jugador.get('bajas_evento_ids') if evento_jugador else None,
-            evento_jugador.get('bajas_evento_nombres') if evento_jugador else None,
-            datos_vivo_ev
-        )
-        ajuste_indiv_capa5 = ajustes_eq_jugador.get(jugador_activo, {})
+            if ajuste_indiv_capa5.get('esta_out', False):
+                st.error(f"🚫 **{jugador_activo}** está detectado actualmente como **OUT / LESIONADO / INACTIVO** ({info_sel.get('status')}). Desmárcalo en el sidebar ('Forzar Jugadores como IN') si deseas proyectar su línea.")
 
-        if ajuste_indiv_capa5.get('esta_out', False):
-            st.error(f"🚫 **{jugador_activo}** está detectado actualmente como **OUT / LESIONADO / INACTIVO** ({info_sel.get('status')}). Desmárcalo en el sidebar ('Forzar Jugadores como IN') si deseas proyectar su línea.")
+            with st.spinner(f"Analizando estadísticas en tiempo real para {jugador_activo}..."):
+                df_jugador_full = consultar_gamelog_jugador(id_seleccionado)
 
-        with st.spinner(f"Analizando estadísticas en tiempo real para {jugador_activo}..."):
-            df_jugador_full = consultar_gamelog_jugador(id_seleccionado)
+            if df_jugador_full is not None and not df_jugador_full.empty:
+                df_jugador_previo = obtener_historial_previo_sin_leakage(df_jugador_full, fecha_busqueda_str)
 
-        if df_jugador_full is not None and not df_jugador_full.empty:
-            df_jugador_previo = obtener_historial_previo_sin_leakage(df_jugador_full, fecha_busqueda_str)
+                lineas_auto_j = calcular_lineas_automaticas_jugador(df_jugador_previo)
+                linea_pts_eval = linea_pts_manual if sobreescribir_lineas else lineas_auto_j['pts']
+                linea_reb_eval = linea_reb_manual if sobreescribir_lineas else lineas_auto_j['reb']
+                linea_ast_eval = linea_ast_manual if sobreescribir_lineas else lineas_auto_j['ast']
+                linea_pra_eval = round(linea_pts_eval + linea_reb_eval + linea_ast_eval - 0.5, 1) if sobreescribir_lineas else lineas_auto_j['pra']
+                origen_lineas_j = "Manual" if sobreescribir_lineas else "Auto-Calculada"
 
-            lineas_auto_j = calcular_lineas_automaticas_jugador(df_jugador_previo)
-            linea_pts_eval = linea_pts_manual if sobreescribir_lineas else lineas_auto_j['pts']
-            linea_reb_eval = linea_reb_manual if sobreescribir_lineas else lineas_auto_j['reb']
-            linea_ast_eval = linea_ast_manual if sobreescribir_lineas else lineas_auto_j['ast']
-            linea_pra_eval = round(linea_pts_eval + linea_reb_eval + linea_ast_eval - 0.5, 1) if sobreescribir_lineas else lineas_auto_j['pra']
-            origen_lineas_j = "Manual" if sobreescribir_lineas else "Auto-Calculada"
+                st.subheader(f"📊 Historial y Rendimiento Real: {jugador_activo} ({equipo_jugador})")
+                st.dataframe(df_jugador_full.head(10), use_container_width=True)
 
-            st.subheader(f"📊 Historial y Rendimiento Real: {jugador_activo} ({equipo_jugador})")
-            st.dataframe(df_jugador_full.head(10), use_container_width=True)
+                if ajuste_indiv_capa5.get('motivos') and not ajuste_indiv_capa5.get('esta_out', False):
+                    st.info(
+                        f"🔄 **Ajuste de Rotación y Usage Bump (Capa 5):** "
+                        f"Minutos Base: **{ajuste_indiv_capa5['min_base']} min** → Ajustados: **{ajuste_indiv_capa5['min_ajustados']} min** | "
+                        f"Multiplicador de Uso: **x{ajuste_indiv_capa5['factor_usage_bump']:.2f}** | "
+                        f"Detalle: {'; '.join(ajuste_indiv_capa5['motivos'])}"
+                    )
 
-            if ajuste_indiv_capa5.get('motivos') and not ajuste_indiv_capa5.get('esta_out', False):
-                st.info(
-                    f"🔄 **Ajuste de Rotación y Usage Bump (Capa 5):** "
-                    f"Minutos Base: **{ajuste_indiv_capa5['min_base']} min** → Ajustados: **{ajuste_indiv_capa5['min_ajustados']} min** | "
-                    f"Multiplicador de Uso: **x{ajuste_indiv_capa5['factor_usage_bump']:.2f}** | "
-                    f"Detalle: {'; '.join(ajuste_indiv_capa5['motivos'])}"
+                posesiones_ctx = None
+                def_rtg_rival_ctx = None
+                rival_abrev_ctx = "Liga (Neutro)"
+                en_b2b_jugador = (team_id_jugador in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
+                factor_paliza_jugador = 1.0
+                riesgo_paliza_txt = "BAJO"
+
+                if evento_jugador:
+                    es_t1 = str(evento_jugador["id_t1"]) == team_id_jugador
+                    id_rival = str(evento_jugador["id_t2"] if es_t1 else evento_jugador["id_t1"])
+                    rival_abrev_ctx = evento_jugador["abrev_t2"] if es_t1 else evento_jugador["abrev_t1"]
+
+                    t1_b2b_ev = (str(evento_jugador["id_t1"]) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
+                    t2_b2b_ev = (str(evento_jugador["id_t2"]) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
+
+                    ctx_j = calcular_contexto_colectivo_capa1(
+                        str(evento_jugador["id_t1"]),
+                        str(evento_jugador["id_t2"]),
+                        metricas_equipos,
+                        promedios_liga,
+                        linea_mercado_ou=evento_jugador.get('linea_mercado_ou'),
+                        spread_mercado=evento_jugador.get('spread_mercado'),
+                        t1_en_b2b=t1_b2b_ev,
+                        t2_en_b2b=t2_b2b_ev
+                    )
+                    posesiones_ctx = ctx_j['posesiones_esperadas']
+                    def_rtg_rival_ctx = metricas_equipos.get(id_rival, {}).get('def_rtg', promedios_liga['def_liga'])
+                    factor_paliza_jugador = ctx_j['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
+                    riesgo_paliza_txt = ctx_j['riesgo_paliza']
+
+                st_pond_j = calcular_estadisticas_ponderadas_jugador(df_jugador_previo)
+                min_auto_sin_bajas = st_pond_j['min']
+                min_auto_con_bajas = ajuste_indiv_capa5.get('min_ajustados', min_auto_sin_bajas) if not ajuste_indiv_capa5.get('esta_out', False) else 0.0
+                min_auto_con_fatiga, notas_fatiga_j = aplicar_ajustes_fatiga_y_paliza_minutos(
+                    min_auto_con_bajas, en_b2b=en_b2b_jugador, factor_recorte_paliza=factor_paliza_jugador
+                )
+                minutos_proyectados_final = min_auto_con_fatiga if usar_min_automaticos else min_proj_manual
+                factor_bump_final = ajuste_indiv_capa5.get('factor_usage_bump', 1.0) if not ajuste_indiv_capa5.get('esta_out', False) else 1.0
+
+                if notas_fatiga_j and not ajuste_indiv_capa5.get('esta_out', False):
+                    st.warning(f"⚡ **Ajuste Automático de Carga / Descanso Prematuro:** {', '.join(notas_fatiga_j)} → Minutos finales proyectados: **{minutos_proyectados_final:.1f} min**")
+
+                proy_detallada = calcular_proyeccion_jugador_capa2_3(
+                    df_jugador=df_jugador_previo,
+                    minutos_proyectados=minutos_proyectados_final,
+                    linea_pts=linea_pts_eval,
+                    linea_reb=linea_reb_eval,
+                    linea_ast=linea_ast_eval,
+                    linea_pra=linea_pra_eval,
+                    posesiones_partido=posesiones_ctx,
+                    def_rtg_rival=def_rtg_rival_ctx,
+                    promedios_liga=promedios_liga,
+                    factor_usage_bump=factor_bump_final,
+                    min_base_sin_bajas=min_auto_sin_bajas,
+                    en_b2b=en_b2b_jugador
                 )
 
-            posesiones_ctx = None
-            def_rtg_rival_ctx = None
-            rival_abrev_ctx = "Liga (Neutro)"
-            en_b2b_jugador = (team_id_jugador in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
-            factor_paliza_jugador = 1.0
-            riesgo_paliza_txt = "BAJO"
+                # --- PANEL DINÁMICO EN VIVO DEL JUGADOR SELECCIONADO (CAPA 4) ---
+                if evento_jugador and proy_detallada and not ajuste_indiv_capa5.get('esta_out', False) and datos_vivo_ev:
+                    marc_str = " vs ".join([f"{eq} {pts}" for eq, pts in datos_vivo_ev["marcadores"].items()])
 
-            if evento_jugador:
-                es_t1 = str(evento_jugador["id_t1"]) == team_id_jugador
-                id_rival = str(evento_jugador["id_t2"] if es_t1 else evento_jugador["id_t1"])
-                rival_abrev_ctx = evento_jugador["abrev_t2"] if es_t1 else evento_jugador["abrev_t1"]
-
-                t1_b2b_ev = (str(evento_jugador["id_t1"]) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
-                t2_b2b_ev = (str(evento_jugador["id_t2"]) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
-
-                ctx_j = calcular_contexto_colectivo_capa1(
-                    str(evento_jugador["id_t1"]),
-                    str(evento_jugador["id_t2"]),
-                    metricas_equipos,
-                    promedios_liga,
-                    linea_mercado_ou=evento_jugador.get('linea_mercado_ou'),
-                    spread_mercado=evento_jugador.get('spread_mercado'),
-                    t1_en_b2b=t1_b2b_ev,
-                    t2_en_b2b=t2_b2b_ev
-                )
-                posesiones_ctx = ctx_j['posesiones_esperadas']
-                def_rtg_rival_ctx = metricas_equipos.get(id_rival, {}).get('def_rtg', promedios_liga['def_liga'])
-                factor_paliza_jugador = ctx_j['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
-                riesgo_paliza_txt = ctx_j['riesgo_paliza']
-
-            st_pond_j = calcular_estadisticas_ponderadas_jugador(df_jugador_previo)
-            min_auto_sin_bajas = st_pond_j['min']
-            min_auto_con_bajas = ajuste_indiv_capa5.get('min_ajustados', min_auto_sin_bajas) if not ajuste_indiv_capa5.get('esta_out', False) else 0.0
-            min_auto_con_fatiga, notas_fatiga_j = aplicar_ajustes_fatiga_y_paliza_minutos(
-                min_auto_con_bajas, en_b2b=en_b2b_jugador, factor_recorte_paliza=factor_paliza_jugador
-            )
-            minutos_proyectados_final = min_auto_con_fatiga if usar_min_automaticos else min_proj_manual
-            factor_bump_final = ajuste_indiv_capa5.get('factor_usage_bump', 1.0) if not ajuste_indiv_capa5.get('esta_out', False) else 1.0
-
-            if notas_fatiga_j and not ajuste_indiv_capa5.get('esta_out', False):
-                st.warning(f"⚡ **Ajuste Automático de Carga / Descanso Prematuro:** {', '.join(notas_fatiga_j)} → Minutos finales proyectados: **{minutos_proyectados_final:.1f} min**")
-
-            proy_detallada = calcular_proyeccion_jugador_capa2_3(
-                df_jugador=df_jugador_previo,
-                minutos_proyectados=minutos_proyectados_final,
-                linea_pts=linea_pts_eval,
-                linea_reb=linea_reb_eval,
-                linea_ast=linea_ast_eval,
-                linea_pra=linea_pra_eval,
-                posesiones_partido=posesiones_ctx,
-                def_rtg_rival=def_rtg_rival_ctx,
-                promedios_liga=promedios_liga,
-                factor_usage_bump=factor_bump_final,
-                min_base_sin_bajas=min_auto_sin_bajas,
-                en_b2b=en_b2b_jugador
-            )
-
-            # --- PANEL DINÁMICO EN VIVO (CAPA 4 - POLLING CADA 30s) ---
-            if evento_jugador and modo_vivo and proy_detallada and not ajuste_indiv_capa5.get('esta_out', False):
-                @st.fragment(run_every=30)
-                def panel_en_vivo_capa4():
-                    obtener_datos_en_vivo_espn.clear()
-                    datos_vivo = obtener_datos_en_vivo_espn(evento_jugador["event_id"])
-                    if not datos_vivo:
-                        return
-
-                    marc_str = " vs ".join([f"{eq} {pts}" for eq, pts in datos_vivo["marcadores"].items()])
-
-                    if datos_vivo["estado"] == "in":
+                    if datos_vivo_ev["estado"] == "in":
                         res_vivo = calcular_ajuste_vivo_capa4(
-                            datos_vivo=datos_vivo,
+                            datos_vivo=datos_vivo_ev,
                             id_jugador_espn=id_seleccionado,
                             nombre_jugador=jugador_activo,
                             df_historial=df_jugador_previo,
@@ -2237,7 +2257,7 @@ with tab_modelo:
                         st.markdown("---")
                         st.markdown(f"""
                             <div class="card-live">
-                                <h3 style="margin:0; color:#93c5fd;">🔴 SEGUIMIENTO EN VIVO — Q{datos_vivo['cuarto']} ({datos_vivo['reloj']}) | Marcador: {marc_str}</h3>
+                                <h3 style="margin:0; color:#93c5fd;">🔴 SEGUIMIENTO EN VIVO — Q{datos_vivo_ev['cuarto']} ({datos_vivo_ev['reloj']}) | Marcador: {marc_str}</h3>
                                 <p style="margin:4px 0 0 0; font-size:13px; color:#cbd5e1;">Sincronización automática cada 30 segundos directamente desde Boxscore oficial.</p>
                             </div>
                         """, unsafe_allow_html=True)
@@ -2278,56 +2298,56 @@ with tab_modelo:
                         else:
                             st.info(f"⏳ El partido está en vivo ({marc_str}), pero {jugador_activo} aún no registra aparición en el boxscore.")
 
-                    elif datos_vivo["estado"] == "pre":
+                    elif datos_vivo_ev["estado"] == "pre":
                         st.info(f"⏳ Partido aún no inicia ({evento_jugador['hora_ecuador']} ECT vs {rival_abrev_ctx}). El progreso en vivo se activará automáticamente en el Q1.")
 
-                panel_en_vivo_capa4()
+                if proy_detallada:
+                    mm_j = proy_detallada['mejor_mercado']
+                    st.markdown("---")
+                    st.subheader(f"🎯 Reporte Probabilístico Integral ({origen_lineas_j}): {jugador_activo}")
+                    st.success(
+                        f"🏆 **Mejor Mercado Recomendado:** **{mm_j['direccion']} {mm_j['linea']} {mm_j['mercado']}** "
+                        f"(Λ: {mm_j['lambda']} | Prob: {mm_j['prob']}% | **Edge {mm_j['edge']:+.1f}%** | "
+                        f"Hit Rate L10: **{int(mm_j['hit_rate'])}%** | Estabilidad: **{mm_j['estabilidad']}**)"
+                    )
+                    st.caption(
+                        f"⚙️ **Contexto Aplicado:** Minutos Proyectados = **{minutos_proyectados_final:.1f} min** | "
+                        f"Rival = **{rival_abrev_ctx}** | Ritmo = **{proy_detallada['factor_ritmo']}x** | "
+                        f"Defensa = **{proy_detallada['factor_rival']}x** | "
+                        f"B2B = **{'Sí' if en_b2b_jugador else 'No'}** | "
+                        f"Riesgo Paliza = **{riesgo_paliza_txt}**"
+                    )
 
-            if proy_detallada:
-                mm_j = proy_detallada['mejor_mercado']
-                st.markdown("---")
-                st.subheader(f"🎯 Reporte Probabilístico Integral ({origen_lineas_j}): {jugador_activo}")
-                st.success(
-                    f"🏆 **Mejor Mercado Recomendado:** **{mm_j['direccion']} {mm_j['linea']} {mm_j['mercado']}** "
-                    f"(Λ: {mm_j['lambda']} | Prob: {mm_j['prob']}% | **Edge {mm_j['edge']:+.1f}%** | "
-                    f"Hit Rate L10: **{int(mm_j['hit_rate'])}%** | Estabilidad: **{mm_j['estabilidad']}**)"
-                )
-                st.caption(
-                    f"⚙️ **Contexto Aplicado:** Minutos Proyectados = **{minutos_proyectados_final:.1f} min** | "
-                    f"Rival = **{rival_abrev_ctx}** | Ritmo = **{proy_detallada['factor_ritmo']}x** | "
-                    f"Defensa = **{proy_detallada['factor_rival']}x** | "
-                    f"B2B = **{'Sí' if en_b2b_jugador else 'No'}** | "
-                    f"Riesgo Paliza = **{riesgo_paliza_txt}**"
-                )
+                    col1, col2, col3, col4 = st.columns(4)
 
-                col1, col2, col3, col4 = st.columns(4)
+                    for col_ui, m_key, titulo_m in [
+                        (col1, 'PTS', '🏀 PUNTOS'),
+                        (col2, 'REB', '📊 REBOTES'),
+                        (col3, 'AST', '🎯 ASISTENCIAS'),
+                        (col4, 'PRA', '🔥 PRA (P+R+A)')
+                    ]:
+                        with col_ui:
+                            m_dat = proy_detallada['mercados_eval'][m_key]
+                            is_more = m_dat['direccion'] == "MÁS"
+                            extra_glow = " card-high-conf" if (m_dat['prob'] >= UMBRAL_ALTA_CONFIANZA and m_dat['edge'] >= 4.5) else ""
+                            css_box = ("card-over" if is_more else "card-under") + extra_glow
+                            badge_m = obtener_html_badge_confianza(m_dat['prob'])
+                            verdict_m = f"🟢 {m_dat['direccion']} {m_dat['linea']}" if is_more else f"🔴 {m_dat['direccion']} {m_dat['linea']}"
+                            p_more_bar = m_dat['prob'] if is_more else (100.0 - m_dat['prob'])
 
-                for col_ui, m_key, titulo_m in [
-                    (col1, 'PTS', '🏀 PUNTOS'),
-                    (col2, 'REB', '📊 REBOTES'),
-                    (col3, 'AST', '🎯 ASISTENCIAS'),
-                    (col4, 'PRA', '🔥 PRA (P+R+A)')
-                ]:
-                    with col_ui:
-                        m_dat = proy_detallada['mercados_eval'][m_key]
-                        is_more = m_dat['direccion'] == "MÁS"
-                        extra_glow = " card-high-conf" if (m_dat['prob'] >= UMBRAL_ALTA_CONFIANZA and m_dat['edge'] >= 4.5) else ""
-                        css_box = ("card-over" if is_more else "card-under") + extra_glow
-                        badge_m = obtener_html_badge_confianza(m_dat['prob'])
-                        verdict_m = f"🟢 {m_dat['direccion']} {m_dat['linea']}" if is_more else f"🔴 {m_dat['direccion']} {m_dat['linea']}"
-                        p_more_bar = m_dat['prob'] if is_more else (100.0 - m_dat['prob'])
+                            st.markdown(f"""
+                                <div class="{css_box}">
+                                    {badge_m}
+                                    <h4 style="margin:0; color:white;">{titulo_m} (Línea: {m_dat['linea']})</h4>
+                                    <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proy: {m_dat['lambda']}</p>
+                                    <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Hit Rate L10: {int(m_dat['hit_rate'])}% | {m_dat['estabilidad']}</p>
+                                    <p style="margin:5px 0 0 0; font-size:17px; font-weight:bold;">{verdict_m}</p>
+                                    <p style="margin:0; font-size:12px; color:#cbd5e1;">Prob: {m_dat['prob']:.1f}% | Edge: {m_dat['edge']:+.1f}%</p>
+                                </div>
+                            """, unsafe_allow_html=True)
+                            st.progress(min(max(int(p_more_bar), 0), 100))
 
-                        st.markdown(f"""
-                            <div class="{css_box}">
-                                {badge_m}
-                                <h4 style="margin:0; color:white;">{titulo_m} (Línea: {m_dat['linea']})</h4>
-                                <p style="margin:5px 0 0 0; font-size:18px; font-weight:bold;">Λ Proy: {m_dat['lambda']}</p>
-                                <p style="margin:2px 0 0 0; font-size:12px; color:#94a3b8;">Hit Rate L10: {int(m_dat['hit_rate'])}% | {m_dat['estabilidad']}</p>
-                                <p style="margin:5px 0 0 0; font-size:17px; font-weight:bold;">{verdict_m}</p>
-                                <p style="margin:0; font-size:12px; color:#cbd5e1;">Prob: {m_dat['prob']:.1f}% | Edge: {m_dat['edge']:+.1f}%</p>
-                            </div>
-                        """, unsafe_allow_html=True)
-                        st.progress(min(max(int(p_more_bar), 0), 100))
+    renderizar_tablero_principal()
 
 # ------------------------------------------------------------------------------
 # PESTAÑA 2: BUSCADOR WEB DE NOTICIAS Y ESTADO DE JUGADORES (CON 1-CLICK SIDEBAR)
@@ -2433,7 +2453,7 @@ with tab_buscador:
                 if es_estatus_baja(row_l['Estatus']) and nom_exacto_sb not in bajas_hoy_detectadas:
                     bajas_hoy_detectadas.append(nom_exacto_sb)
 
-        col_sync1, col_sync2 = st.columns([1.3, 1.7])
+        col_sync1, col_sync2 = st.columns([1.2, 1.8])
         with col_sync1:
             if st.button(
                 f"⚡ Aplicar TODOS los OUT de Hoy al Sidebar ({len(bajas_hoy_detectadas)} jugadores)",
@@ -2443,7 +2463,15 @@ with tab_buscador:
                 st.session_state['pendiente_aplicar_out'] = bajas_hoy_detectadas
                 st.rerun()
         with col_sync2:
-            solo_hoy_chk = st.checkbox("Mostrar en la tabla solo jugadores de equipos que juegan hoy", value=True)
+            filtro_cartelera_les = st.selectbox(
+                "Filtrar tabla por disponibilidad en cartelera:",
+                [
+                    "✅ Solo equipos que SÍ juegan hoy (En Cartelera)",
+                    "— Solo equipos que NO juegan hoy (Descansan)",
+                    "🌎 Mostrar toda la liga (Todos)"
+                ],
+                index=0
+            )
 
         filtro_lesion_txt = st.text_input(
             "Filtrar tabla por equipo, jugador o estatus (ej. Out, Day-To-Day, Lakers, Heat):",
@@ -2451,8 +2479,10 @@ with tab_buscador:
         )
 
         df_mostrar_les = df_lesiones_full.copy()
-        if solo_hoy_chk:
-            df_mostrar_les = df_mostrar_les[df_mostrar_les['Juega Hoy'].str.contains("Sí")]
+        if "SÍ juegan hoy" in filtro_cartelera_les:
+            df_mostrar_les = df_mostrar_les[df_mostrar_les['Juega Hoy'].str.contains("Sí", na=False)]
+        elif "NO juegan hoy" in filtro_cartelera_les:
+            df_mostrar_les = df_mostrar_les[df_mostrar_les['Juega Hoy'].str.contains("No juega hoy", na=False)]
 
         if filtro_lesion_txt.strip():
             mask = df_mostrar_les.apply(
