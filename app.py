@@ -5,6 +5,8 @@ import numpy as np
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+import json
+import os
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson, norm
 
@@ -131,6 +133,7 @@ st.markdown("""
 UMBRAL_ALTA_CONFIANZA = 58.0
 BREAK_EVEN_ODDS_110 = 52.38
 UMBRAL_EDGE_OPERABLE = 5.0
+ARCHIVO_TICKETS_CACHE = ".nba_tickets_snapshot.json"
 
 ESTATUS_NO_DISPONIBLE = [
     'out', 'injured', 'injury', 'doubtful', 'suspension', 'suspended',
@@ -1355,7 +1358,7 @@ def calcular_ajuste_vivo_capa4(
 
 
 # ==============================================================================
-# 5. COMPONENTES VISUALES
+# 5. COMPONENTES VISUALES Y MOTOR DE TICKETS CONGELADOS (TICKET 1 Y TICKET 2)
 # ==============================================================================
 
 def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
@@ -1363,7 +1366,6 @@ def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
     p2 = round(100.0 - p1, 1)
     p1 = round(p1, 1)
 
-    badge_ganador = ""
     edge_fav = round(max(p1, p2) - BREAK_EVEN_ODDS_110, 1)
     if edge_fav >= UMBRAL_EDGE_OPERABLE:
         fav = abrev_t1 if p1 >= p2 else abrev_t2
@@ -1390,6 +1392,257 @@ def obtener_html_badge_confianza(prob_rec):
     if prob_rec >= UMBRAL_ALTA_CONFIANZA and edge_val >= UMBRAL_EDGE_OPERABLE:
         return f'<div class="badge-high-conf">🔥 ALTA CONFIANZA ({prob_rec:.1f}% | Edge +{edge_val}%)</div>'
     return f'<div class="badge-normal-conf">⚖️ Estándar ({prob_rec:.1f}% | Edge {edge_val:+.1f}%)</div>'
+
+
+def cargar_tickets_guardados_disco():
+    if os.path.exists(ARCHIVO_TICKETS_CACHE):
+        try:
+            with open(ARCHIVO_TICKETS_CACHE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def guardar_tickets_en_disco(data_dict):
+    try:
+        with open(ARCHIVO_TICKETS_CACHE, "w", encoding="utf-8") as f:
+            json.dump(data_dict, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
+    candidatos_pool = []
+
+    for eq in resumen_equipos:
+        enc = eq.get('Encuentro', '')
+        hora = eq.get('Hora (ECT)', '')
+        if eq.get('_ml_valido'):
+            gan_txt = eq.get('Ganador Sugerido', '')
+            abrev_g = gan_txt.split(' ')[0]
+            try:
+                prob_ml = float(gan_txt.split('(')[1].split('%')[0])
+                edge_ml = float(gan_txt.split('Edge ')[1].split('%')[0])
+            except Exception:
+                prob_ml, edge_ml = 60.0, 7.5
+            candidatos_pool.append({
+                'id_pick': f"EQ_ML_{enc}_{abrev_g}",
+                'tipo': 'Equipo (ML)',
+                'encuentro': enc,
+                'hora': hora,
+                'seleccion': f"{abrev_g} Ganador (ML)",
+                'linea_ref': "Moneyline",
+                'proyeccion_fija': f"Prob. {prob_ml:.1f}%",
+                'prob_fija': prob_ml,
+                'edge_fijo': edge_ml,
+                'score_ranking': prob_ml + (edge_ml * 0.45),
+                'clave_equipo': enc,
+                'clave_jugador': None,
+                'direccion': 'ML',
+                'abrev_ganador': abrev_g
+            })
+
+        if eq.get('_ou_valido'):
+            pred_txt = eq.get('Predicción Total', '')
+            dir_ou = pred_txt.split(' ')[0]
+            linea_ou_str = str(eq.get('Línea O/U', '')).split(' ')[0]
+            pts_proy = eq.get('Pts Proyectados', 0)
+            try:
+                linea_ou_val = float(linea_ou_str)
+                prob_ou = float(pred_txt.split('(')[1].split('%')[0])
+                edge_ou = float(pred_txt.split('Edge ')[1].split('%')[0])
+            except Exception:
+                linea_ou_val, prob_ou, edge_ou = 220.5, 60.0, 7.5
+            candidatos_pool.append({
+                'id_pick': f"EQ_OU_{enc}_{dir_ou}_{linea_ou_val}",
+                'tipo': 'Total Partido (O/U)',
+                'encuentro': enc,
+                'hora': hora,
+                'seleccion': f"{dir_ou} {linea_ou_val} Pts Totales",
+                'linea_ref': linea_ou_val,
+                'proyeccion_fija': f"Proy. {pts_proy} pts",
+                'prob_fija': prob_ou,
+                'edge_fijo': edge_ou,
+                'score_ranking': prob_ou + (edge_ou * 0.45),
+                'clave_equipo': enc,
+                'clave_jugador': None,
+                'direccion': dir_ou
+            })
+
+    for jug in resumen_jugadores:
+        edge_j = float(jug.get('_edge_num', 0.0))
+        hr_j = float(jug.get('_hr_num', 0.0))
+        estab_j = str(jug.get('_estab_txt', ''))
+        if edge_j < 4.5 or hr_j < 60.0 or "Volátil" in estab_j:
+            continue
+
+        try:
+            prob_j = float(str(jug.get('Prob.', '58%')).replace('%', ''))
+        except Exception:
+            prob_j = 58.0
+
+        bonus_estab = 2.5 if "Estable" in estab_j else 0.0
+        candidatos_pool.append({
+            'id_pick': f"JUG_{jug.get('Jugador')}_{jug.get('Mercado')}",
+            'tipo': f"Jugador ({jug.get('Mercado')})",
+            'encuentro': jug.get('Encuentro', ''),
+            'hora': '-',
+            'seleccion': f"{jug.get('Jugador')} — {jug.get('Recomendación')}",
+            'linea_ref': float(jug.get('Línea', 0.0)),
+            'proyeccion_fija': f"Λ {jug.get('Λ Proy.')} (L10: {jug.get('Hit Rate L10')})",
+            'prob_fija': prob_j,
+            'edge_fijo': edge_j,
+            'score_ranking': prob_j + (edge_j * 0.40) + bonus_estab,
+            'clave_equipo': jug.get('Encuentro', ''),
+            'clave_jugador': jug.get('Jugador', ''),
+            'mercado_jug': jug.get('Mercado', 'PTS'),
+            'direccion': str(jug.get('Recomendación', '')).split(' ')[0]
+        })
+
+    candidatos_pool.sort(key=lambda x: x['score_ranking'], reverse=True)
+
+    ticket_1 = []
+    encuentros_t1 = set()
+    ids_usados_t1 = set()
+    for c in candidatos_pool:
+        if c['encuentro'] not in encuentros_t1:
+            ticket_1.append(c)
+            encuentros_t1.add(c['encuentro'])
+            ids_usados_t1.add(c['id_pick'])
+        if len(ticket_1) == 3:
+            break
+
+    if len(ticket_1) < 3:
+        for c in candidatos_pool:
+            if c['id_pick'] not in ids_usados_t1:
+                ticket_1.append(c)
+                ids_usados_t1.add(c['id_pick'])
+            if len(ticket_1) == 3:
+                break
+
+    ticket_2 = []
+    encuentros_t2 = set()
+    ids_usados_t2 = set()
+    for c in candidatos_pool:
+        if c['id_pick'] in ids_usados_t1:
+            continue
+        if c['encuentro'] not in encuentros_t2:
+            ticket_2.append(c)
+            encuentros_t2.add(c['encuentro'])
+            ids_usados_t2.add(c['id_pick'])
+        if len(ticket_2) == 3:
+            break
+
+    if len(ticket_2) < 3:
+        for c in candidatos_pool:
+            if c['id_pick'] not in ids_usados_t1 and c['id_pick'] not in ids_usados_t2:
+                ticket_2.append(c)
+                ids_usados_t2.add(c['id_pick'])
+            if len(ticket_2) == 3:
+                break
+
+    return {'ticket_1': ticket_1, 'ticket_2': ticket_2}
+
+
+def evaluar_estado_actual_pick_congelado(pick, mapa_equipos_actual, mapa_jugadores_actual):
+    tipo = pick.get('tipo', '')
+    enc = pick.get('encuentro', '')
+
+    if tipo == 'Equipo (ML)':
+        eq_row = mapa_equipos_actual.get(enc)
+        if not eq_row:
+            return "-", "⏳ Pendiente"
+        estado_p = str(eq_row.get('Estado', ''))
+        marcador_p = str(eq_row.get('Marcador', '-'))
+        abrev_g = pick.get('abrev_ganador', '')
+
+        if estado_p == 'Finalizado':
+            s1_r = eq_row.get('_s1_num')
+            s2_r = eq_row.get('_s2_num')
+            abr1_r = eq_row.get('_abr1')
+            abr2_r = eq_row.get('_abr2')
+            if s1_r is not None and s2_r is not None and abr1_r and abr2_r:
+                gan_real = abr1_r if s1_r > s2_r else abr2_r
+                return marcador_p, ("🟢 Acierto" if gan_real == abrev_g else "🔴 Fallo")
+            res_g = str(eq_row.get('Resultado Ganador', ''))
+            if "Acierto" in res_g:
+                return marcador_p, "🟢 Acierto"
+            elif "Fallo" in res_g:
+                return marcador_p, "🔴 Fallo"
+            return marcador_p, res_g
+        elif "🔴" in estado_p:
+            return marcador_p, f"⏳ En vivo ({estado_p.replace('🔴', '').strip()})"
+        return "-", "⏳ Pendiente"
+
+    elif tipo == 'Total Partido (O/U)':
+        eq_row = mapa_equipos_actual.get(enc)
+        if not eq_row:
+            return "-", "⏳ Pendiente"
+        estado_p = str(eq_row.get('Estado', ''))
+        pts_act = eq_row.get('_total_num')
+        linea_fija = float(pick.get('linea_ref', 0.0))
+        dir_fija = pick.get('direccion', 'MÁS')
+
+        if estado_p == 'Finalizado' and pts_act is not None:
+            if pts_act == linea_fija:
+                return f"{pts_act} pts", "🟡 Push (Empate)"
+            if dir_fija == "MÁS":
+                return f"{pts_act} pts", ("🟢 Acierto" if pts_act > linea_fija else "🔴 Fallo")
+            else:
+                return f"{pts_act} pts", ("🟢 Acierto" if pts_act < linea_fija else "🔴 Fallo")
+        elif "🔴" in estado_p and pts_act is not None:
+            if dir_fija == "MÁS" and pts_act > linea_fija:
+                return f"🔴 {pts_act} pts", "🟢 Superada (Vivo)"
+            elif dir_fija == "MENOS" and pts_act > linea_fija:
+                return f"🔴 {pts_act} pts", "🔴 Superada en contra"
+            return f"🔴 {pts_act} pts", f"⏳ En juego ({estado_p.replace('🔴', '').strip()})"
+        return "-", "⏳ Pendiente"
+
+    else:
+        nom_j = pick.get('clave_jugador', '')
+        jug_row = mapa_jugadores_actual.get(nom_j)
+        if not jug_row:
+            return "-", "⏳ Pendiente"
+
+        real_vivo = str(jug_row.get('Real / Vivo', '-'))
+        box_txt = str(jug_row.get('Boxscore', '-'))
+        res_txt = str(jug_row.get('Resultado', 'Pendiente'))
+        linea_fija = float(pick.get('linea_ref', 0.0))
+        dir_fija = pick.get('direccion', 'MÁS')
+        merc_fijo = pick.get('mercado_jug', 'PTS')
+
+        val_real = None
+        if "/" in box_txt:
+            try:
+                partes_b = [p.strip() for p in box_txt.split("/")]
+                p_v = int(partes_b[0].replace("P", ""))
+                r_v = int(partes_b[1].replace("R", ""))
+                a_v = int(partes_b[2].replace("A", ""))
+                mapa_vals = {'PTS': p_v, 'REB': r_v, 'AST': a_v, 'PRA': p_v + r_v + a_v}
+                val_real = mapa_vals.get(merc_fijo)
+            except Exception:
+                val_real = None
+
+        es_final = ("Acierto" in res_txt) or ("Fallo" in res_txt) or ("Push" in res_txt) or ("No jugó" in res_txt)
+        if "No jugó" in res_txt:
+            return "DNP", "🟡 Anulado (No jugó)"
+
+        if es_final and val_real is not None:
+            if val_real == linea_fija:
+                return f"{val_real} {merc_fijo} ({box_txt})", "🟡 Push (Empate)"
+            if dir_fija == "MÁS":
+                return f"{val_real} {merc_fijo} ({box_txt})", ("🟢 Acierto" if val_real > linea_fija else "🔴 Fallo")
+            else:
+                return f"{val_real} {merc_fijo} ({box_txt})", ("🟢 Acierto" if val_real < linea_fija else "🔴 Fallo")
+        elif "🔴" in real_vivo and val_real is not None:
+            if dir_fija == "MÁS" and val_real > linea_fija:
+                return f"🔴 {val_real} {merc_fijo} ({box_txt})", "🟢 Superada (Vivo)"
+            elif dir_fija == "MENOS" and val_real > linea_fija:
+                return f"🔴 {val_real} {merc_fijo} ({box_txt})", "🔴 Superada en contra"
+            return f"🔴 {val_real} {merc_fijo} ({box_txt})", res_txt
+
+        return real_vivo, res_txt
 
 
 # ==============================================================================
@@ -1442,7 +1695,7 @@ if jugador_seleccionado != "-- Selecciona un jugador --":
     else:
         st.sidebar.markdown(f'<div class="status-active">✅ <b>Estatus:</b> {status_actual} (Disponible)</div>', unsafe_allow_html=True)
 
-# --- CAPA 5: CONTROLES MANUALES OUT / IN EN EL SIDEBAR (COLA SEGURA ANTES DE INSTANCIAR WIDGETS) ---
+# --- CAPA 5: CONTROLES MANUALES OUT / IN EN EL SIDEBAR ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🏥 Alineaciones y Bajas (Capa 5)")
 
@@ -1461,7 +1714,6 @@ if 'bajas_manuales_out_state' not in st.session_state:
 if 'altas_manuales_in_state' not in st.session_state:
     st.session_state['altas_manuales_in_state'] = []
 
-# Procesar cambios enviados desde la pestaña Buscador ANTES de crear los multiselect
 if 'pendiente_aplicar_out' in st.session_state:
     nuevos_out = st.session_state.pop('pendiente_aplicar_out')
     actual_out = list(st.session_state['bajas_manuales_out_state'])
@@ -1490,7 +1742,6 @@ if st.session_state.pop('pendiente_limpiar_listas', False):
     st.session_state['bajas_manuales_out_state'] = []
     st.session_state['altas_manuales_in_state'] = []
 
-# Filtrar para asegurar que solo queden jugadores válidos de la fecha activa
 st.session_state['bajas_manuales_out_state'] = [
     j for j in st.session_state['bajas_manuales_out_state'] if j in jugadores_jornada
 ]
@@ -1566,7 +1817,7 @@ tab_modelo, tab_buscador = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: MOTOR PROBABILÍSTICO Y CARTELERA (CON AUTO-POLLING EN VIVO CADA 30s)
+# PESTAÑA 1: MOTOR PROBABILÍSTICO, CARTELERA, TABLAS Y TICKETS CONGELADOS
 # ------------------------------------------------------------------------------
 with tab_modelo:
     @st.fragment(run_every=30 if modo_vivo else None)
@@ -1576,6 +1827,7 @@ with tab_modelo:
             obtener_datos_en_vivo_espn.clear()
 
         cartelera_actual = obtener_cartelera_por_fecha(fecha_str_api)
+        ciclo_key = datetime.now(timezone(timedelta(hours=-5))).strftime("%H%M%S") if modo_vivo else "static"
 
         st.subheader(f"📅 Cartelera de Partidos (Hora de Ecuador - UTC-5) — Fecha: {fecha_seleccionada}")
         if modo_vivo:
@@ -1650,20 +1902,29 @@ with tab_modelo:
                     partido_en_vivo = partido['estado_codigo'] == 'in'
                     partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
 
-                    # Consultar summary en vivo si el partido está en curso, finalizado o en ventana de inicio
                     datos_vivo_p = obtener_datos_en_vivo_espn(partido['event_id']) if (partido_en_vivo or partido_finalizado or modo_vivo) else None
 
-                    # Sincronizar marcador y estado en tiempo real desde summary si está disponible
-                    if datos_vivo_p and datos_vivo_p.get("marcadores"):
-                        marc_vivo = datos_vivo_p["marcadores"]
-                        if partido['abrev_t1'] in marc_vivo:
-                            partido['score_t1'] = marc_vivo[partido['abrev_t1']]
-                        if partido['abrev_t2'] in marc_vivo:
-                            partido['score_t2'] = marc_vivo[partido['abrev_t2']]
+                    if datos_vivo_p:
                         if datos_vivo_p.get("estado"):
                             partido['estado_codigo'] = datos_vivo_p["estado"]
                         if datos_vivo_p.get("detalle_estado"):
                             partido['estado'] = datos_vivo_p["detalle_estado"]
+
+                        marc_vivo = datos_vivo_p.get("marcadores", {})
+                        s1_api = marc_vivo.get(partido['abrev_t1'], partido['score_t1'])
+                        s2_api = marc_vivo.get(partido['abrev_t2'], partido['score_t2'])
+
+                        pts_box_t1 = sum(
+                            j.get("PTS_ACTUAL", 0) for j in datos_vivo_p.get("jugadores_por_id", {}).values()
+                            if j.get("equipo") == partido['abrev_t1']
+                        )
+                        pts_box_t2 = sum(
+                            j.get("PTS_ACTUAL", 0) for j in datos_vivo_p.get("jugadores_por_id", {}).values()
+                            if j.get("equipo") == partido['abrev_t2']
+                        )
+
+                        partido['score_t1'] = max(int(s1_api), int(pts_box_t1))
+                        partido['score_t2'] = max(int(s2_api), int(pts_box_t2))
 
                     partido_en_vivo = partido['estado_codigo'] == 'in'
                     partido_finalizado = partido['estado_codigo'] == 'post' or partido['estado'].lower() in ['finalized', 'final', 'closed']
@@ -1959,7 +2220,7 @@ with tab_modelo:
                             'Mercado Operable': clasif_eq['mercado_operable'],
                             'Hora (ECT)': partido['hora_ecuador'],
                             'Encuentro': partido['encuentro'],
-                            'Marcador': f"🏁 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
+                            'Marcador': f"🏁 {partido['abrev_t1']} {s1}-{s2} {partido['abrev_t2']}",
                             'Ganador Sugerido': ganador_display,
                             'Resultado Ganador': acerto_ganador if clasif_eq['ml_valido'] else f"No operable ({acerto_ganador})",
                             'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
@@ -1971,7 +2232,12 @@ with tab_modelo:
                             '_ml_valido': clasif_eq['ml_valido'],
                             '_ou_valido': clasif_eq['ou_valido'],
                             '_es_operable': clasif_eq['es_operable'],
-                            '_score_orden': clasif_eq['score_orden']
+                            '_score_orden': clasif_eq['score_orden'],
+                            '_s1_num': s1,
+                            '_s2_num': s2,
+                            '_total_num': total_actual,
+                            '_abr1': partido['abrev_t1'],
+                            '_abr2': partido['abrev_t2']
                         })
 
                         st.info(f"📊 **Resultado Final Real:** {partido['abrev_t1']} **{s1} - {s2}** {partido['abrev_t2']} (Total: {total_actual} pts)")
@@ -1992,7 +2258,7 @@ with tab_modelo:
                             'Mercado Operable': clasif_eq['mercado_operable'],
                             'Hora (ECT)': partido['hora_ecuador'],
                             'Encuentro': partido['encuentro'],
-                            'Marcador': f"🔴 {partido['abrev_t1']} {s1} - {s2} {partido['abrev_t2']}",
+                            'Marcador': f"🔴 {partido['abrev_t1']} {s1}-{s2} {partido['abrev_t2']} ({partido['estado']})",
                             'Ganador Sugerido': ganador_display,
                             'Resultado Ganador': estado_ganador_vivo,
                             'Línea O/U': f"{linea_ou_partido} ({origen_ou_partido})",
@@ -2004,7 +2270,12 @@ with tab_modelo:
                             '_ml_valido': clasif_eq['ml_valido'],
                             '_ou_valido': clasif_eq['ou_valido'],
                             '_es_operable': clasif_eq['es_operable'],
-                            '_score_orden': clasif_eq['score_orden']
+                            '_score_orden': clasif_eq['score_orden'],
+                            '_s1_num': s1,
+                            '_s2_num': s2,
+                            '_total_num': total_actual,
+                            '_abr1': partido['abrev_t1'],
+                            '_abr2': partido['abrev_t2']
                         })
 
                         col_r1, col_r2 = st.columns(2)
@@ -2036,7 +2307,12 @@ with tab_modelo:
                             '_ml_valido': clasif_eq['ml_valido'],
                             '_ou_valido': clasif_eq['ou_valido'],
                             '_es_operable': clasif_eq['es_operable'],
-                            '_score_orden': clasif_eq['score_orden']
+                            '_score_orden': clasif_eq['score_orden'],
+                            '_s1_num': None,
+                            '_s2_num': None,
+                            '_total_num': None,
+                            '_abr1': partido['abrev_t1'],
+                            '_abr2': partido['abrev_t2']
                         })
 
                         col_r1, col_r2 = st.columns(2)
@@ -2056,7 +2332,7 @@ with tab_modelo:
         else:
             st.info(f"No hay partidos registrados en la cartelera oficial para la fecha: {fecha_seleccionada}.")
 
-        # --- RESUMEN EJECUTIVO DE EQUIPOS Y JUGADORES ---
+        # --- RESUMEN EJECUTIVO DE EQUIPOS ---
         if resumen_equipos:
             st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Clasificados por Edge Real)")
             st.markdown(
@@ -2065,7 +2341,8 @@ with tab_modelo:
             )
            
             df_equipos = pd.DataFrame(resumen_equipos)
-            df_equipos = df_equipos.sort_values(by='_score_orden', ascending=False)
+            df_equipos['_en_vivo_prio'] = df_equipos['Estado'].astype(str).str.contains("🔴", na=False).astype(int)
+            df_equipos = df_equipos.sort_values(by=['_en_vivo_prio', '_score_orden'], ascending=[False, False])
 
             if "Doble Edge" in filtro_equipos_modo:
                 df_equipos = df_equipos[df_equipos['_ml_valido'] & df_equipos['_ou_valido']]
@@ -2076,7 +2353,7 @@ with tab_modelo:
             elif "Solo Partidos Operables" in filtro_equipos_modo:
                 df_equipos = df_equipos[df_equipos['_es_operable']]
 
-            cols_ocultas_eq = ['_ml_valido', '_ou_valido', '_es_operable', '_score_orden']
+            cols_ocultas_eq = ['_ml_valido', '_ou_valido', '_es_operable', '_score_orden', '_en_vivo_prio', '_s1_num', '_s2_num', '_total_num', '_abr1', '_abr2']
             df_equipos_export = df_equipos.drop(columns=cols_ocultas_eq, errors='ignore').copy()
             if not df_equipos_export.empty:
                 csv_equipos = df_equipos_export.to_csv(index=False).encode('utf-8')
@@ -2086,11 +2363,12 @@ with tab_modelo:
                     file_name=f"nba_equipos_{fecha_seleccionada}.csv",
                     mime="text/csv",
                 )
-                st.dataframe(df_equipos_export, use_container_width=True, hide_index=True)
+                st.dataframe(df_equipos_export, use_container_width=True, hide_index=True, key=f"tbl_eq_{ciclo_key}")
             else:
                 st.info("Ningún encuentro cumple el filtro seleccionado en el sidebar.")
             st.markdown("---")
 
+        # --- RESUMEN EJECUTIVO DE JUGADORES ---
         if resumen_jugadores:
             st.subheader("⭐ Resumen Ejecutivo: Mejores Mercados de Jugadores (Ordenados por Calidad)")
             st.markdown(
@@ -2098,7 +2376,8 @@ with tab_modelo:
             )
            
             df_jugadores_res = pd.DataFrame(resumen_jugadores)
-            df_jugadores_res = df_jugadores_res.sort_values(by='_score_calidad', ascending=False)
+            df_jugadores_res['_en_vivo_prio'] = df_jugadores_res['Real / Vivo'].astype(str).str.contains("🔴", na=False).astype(int)
+            df_jugadores_res = df_jugadores_res.sort_values(by=['_en_vivo_prio', '_score_calidad'], ascending=[False, False])
 
             if aplicar_filtros_calidad:
                 df_jugadores_res = df_jugadores_res[
@@ -2108,7 +2387,7 @@ with tab_modelo:
                 if excluir_volatiles:
                     df_jugadores_res = df_jugadores_res[~df_jugadores_res['_estab_txt'].str.contains("Volátil", na=False)]
 
-            cols_ocultas = ['_edge_num', '_hr_num', '_estab_txt', '_score_calidad']
+            cols_ocultas = ['_edge_num', '_hr_num', '_estab_txt', '_score_calidad', '_en_vivo_prio']
             df_jugadores_export = df_jugadores_res.drop(columns=cols_ocultas, errors='ignore').copy()
 
             if not df_jugadores_export.empty:
@@ -2119,9 +2398,130 @@ with tab_modelo:
                     file_name=f"nba_jugadores_{fecha_seleccionada}.csv",
                     mime="text/csv",
                 )
-                st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True)
+                st.dataframe(df_jugadores_export, use_container_width=True, hide_index=True, key=f"tbl_jug_{ciclo_key}")
             else:
                 st.info("Ningún jugador cumple los filtros estrictos de calidad seleccionados en el sidebar. Prueba bajar el Edge Mínimo o desactivar el filtro.")
+            st.markdown("---")
+
+        # ======================================================================
+        # SIMULACIÓN DE TICKETS CONGELADOS (TICKET 1 Y TICKET 2 MÁS PROBABLES)
+        # ======================================================================
+        if resumen_equipos or resumen_jugadores:
+            st.subheader(f"🎟️ Simulación de Tickets Más Probables — Fecha: {fecha_seleccionada}")
+            st.markdown(
+                "Las **selecciones, líneas y proyecciones quedan congeladas** para esta fecha (no cambian durante los partidos), "
+                "pero el **estado de acierto/fallo se actualiza automáticamente** en vivo y al finalizar."
+            )
+
+            if 'tickets_snapshot_store' not in st.session_state:
+                st.session_state['tickets_snapshot_store'] = cargar_tickets_guardados_disco()
+
+            col_tk_btn1, col_tk_btn2 = st.columns([1.2, 2.8])
+            with col_tk_btn1:
+                if st.button("🔄 Regenerar Tickets para esta Fecha", key=f"regen_tk_{fecha_busqueda_str}"):
+                    nuevos_tk = construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores)
+                    st.session_state['tickets_snapshot_store'][fecha_busqueda_str] = nuevos_tk
+                    guardar_tickets_en_disco(st.session_state['tickets_snapshot_store'])
+                    st.rerun()
+
+            if fecha_busqueda_str not in st.session_state['tickets_snapshot_store']:
+                tickets_dia = construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores)
+                if tickets_dia['ticket_1'] or tickets_dia['ticket_2']:
+                    st.session_state['tickets_snapshot_store'][fecha_busqueda_str] = tickets_dia
+                    guardar_tickets_en_disco(st.session_state['tickets_snapshot_store'])
+            else:
+                tickets_dia = st.session_state['tickets_snapshot_store'][fecha_busqueda_str]
+
+            mapa_eq_actual = {r['Encuentro']: r for r in resumen_equipos}
+            mapa_jug_actual = {r['Jugador']: r for r in resumen_jugadores}
+
+            def renderizar_tarjeta_ticket(titulo_ticket, subtitulo_ticket, lista_picks, key_tabla):
+                if not lista_picks:
+                    st.info(f"No hay suficientes selecciones con ventaja estadística para armar **{titulo_ticket}** en esta fecha.")
+                    return
+
+                filas_tk = []
+                aciertos = 0
+                fallos = 0
+                en_vivo_cnt = 0
+                pendientes = 0
+                prob_combinada = 1.0
+
+                for p in lista_picks:
+                    real_txt, estado_eval = evaluar_estado_actual_pick_congelado(p, mapa_eq_actual, mapa_jug_actual)
+                    prob_combinada *= (float(p.get('prob_fija', 58.0)) / 100.0)
+
+                    if "🟢 Acierto" in estado_eval or "🟢 Superada" in estado_eval:
+                        aciertos += 1
+                    elif "🔴 Fallo" in estado_eval or "🔴 Superada en contra" in estado_eval:
+                        fallos += 1
+                    elif "⏳ En" in estado_eval:
+                        en_vivo_cnt += 1
+                    else:
+                        pendientes += 1
+
+                    filas_tk.append({
+                        'Tipo': p['tipo'],
+                        'Encuentro': p['encuentro'],
+                        'Selección Congelada': p['seleccion'],
+                        'Proyección Fija': p['proyeccion_fija'],
+                        'Prob. Fija': f"{p['prob_fija']:.1f}%",
+                        'Edge Fijo': f"{p['edge_fijo']:+.1f}%",
+                        'Resultado Real / Vivo': real_txt,
+                        'Estado': estado_eval
+                    })
+
+                total_legs = len(lista_picks)
+                prob_comb_pct = round(prob_combinada * 100.0, 1)
+
+                if fallos > 0:
+                    banner_estado = f"❌ TICKET FALLADO ({aciertos}/{total_legs} acertadas | {fallos} fallada)"
+                    color_borde = "#ef4444"
+                    bg_card = "rgba(239, 68, 68, 0.14)"
+                elif aciertos == total_legs and pendientes == 0 and en_vivo_cnt == 0:
+                    banner_estado = f"🏆 TICKET GANADO ({aciertos}/{total_legs} ACERTADAS)"
+                    color_borde = "#10b981"
+                    bg_card = "rgba(16, 185, 129, 0.16)"
+                elif en_vivo_cnt > 0 or aciertos > 0:
+                    banner_estado = f"🔴 EN SEGUIMIENTO ({aciertos}/{total_legs} acertadas | {en_vivo_cnt} en juego)"
+                    color_borde = "#3b82f6"
+                    bg_card = "rgba(59, 130, 246, 0.14)"
+                else:
+                    banner_estado = f"⏳ PENDIENTE DE INICIO (0/{total_legs} jugadas)"
+                    color_borde = "#f59e0b"
+                    bg_card = "rgba(245, 158, 11, 0.12)"
+
+                st.markdown(f"""
+                    <div style="background-color: {bg_card}; border: 1px solid {color_borde}; border-radius: 10px; padding: 14px; margin-bottom: 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+                            <div>
+                                <h4 style="margin: 0; color: #ffffff;">{titulo_ticket}</h4>
+                                <span style="font-size: 13px; color: #cbd5e1;">{subtitulo_ticket} • Probabilidad Combinada Congelada: <b>{prob_comb_pct}%</b></span>
+                            </div>
+                            <div style="font-weight: 800; font-size: 14px; padding: 5px 12px; border-radius: 999px; background-color: rgba(15, 23, 42, 0.75); color: #ffffff; border: 1px solid {color_borde};">
+                                {banner_estado}
+                            </div>
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+
+                st.dataframe(pd.DataFrame(filas_tk), use_container_width=True, hide_index=True, key=key_tabla)
+
+            col_tk1, col_tk2 = st.columns(2)
+            with col_tk1:
+                renderizar_tarjeta_ticket(
+                    "🎟️ TICKET 1 — Máxima Probabilidad (Élite)",
+                    "Top 3 selecciones más seguras de encuentros distintos",
+                    tickets_dia.get('ticket_1', []),
+                    f"df_tk1_{fecha_busqueda_str}_{ciclo_key}"
+                )
+            with col_tk2:
+                renderizar_tarjeta_ticket(
+                    "🎟️ TICKET 2 — Combinada de Alto Valor (Edge)",
+                    "Siguientes 3 mejores oportunidades independientes",
+                    tickets_dia.get('ticket_2', []),
+                    f"df_tk2_{fecha_busqueda_str}_{ciclo_key}"
+                )
             st.markdown("---")
 
         # --- ANÁLISIS DETALLADO DEL JUGADOR ---
