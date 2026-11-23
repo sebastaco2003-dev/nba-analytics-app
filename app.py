@@ -1668,9 +1668,15 @@ fecha_defecto = st.session_state.get('fecha_input', datetime.now(timezone(timede
 fecha_seleccionada = st.sidebar.date_input("Seleccionar Fecha de Cartelera", value=fecha_defecto, key='fecha_input')
 fecha_str_api = fecha_seleccionada.strftime("%Y%m%d")
 fecha_busqueda_str = fecha_seleccionada.strftime("%Y-%m-%d")
+clave_backup_cartelera = f"backup_cartelera_{fecha_str_api}"
 
 with st.spinner(f"Sincronizando cartelera, reportes médicos, fatiga B2B y ratings para el {fecha_seleccionada}..."):
     cartelera_fecha = obtener_cartelera_por_fecha(fecha_str_api)
+    if cartelera_fecha:
+        st.session_state[clave_backup_cartelera] = cartelera_fecha
+    elif clave_backup_cartelera in st.session_state:
+        cartelera_fecha = st.session_state[clave_backup_cartelera]
+
     equipos_b2b_hoy = detectar_equipos_back_to_back(fecha_seleccionada)
     catalogo_jugadores = obtener_mapa_jugadores_completo()
     metricas_equipos, promedios_liga = obtener_metricas_avanzadas_equipos()
@@ -1822,11 +1828,22 @@ tab_modelo, tab_buscador = st.tabs([
 with tab_modelo:
     @st.fragment(run_every=30 if modo_vivo else None)
     def renderizar_tablero_principal():
+        # Asegurar respaldo persistente para que ningún micro-corte de ESPN deje la cartelera en blanco
+        if cartelera_fecha:
+            st.session_state[clave_backup_cartelera] = cartelera_fecha
+
         if modo_vivo:
             obtener_cartelera_por_fecha.clear()
             obtener_datos_en_vivo_espn.clear()
+            cartelera_nueva = obtener_cartelera_por_fecha(fecha_str_api)
+            if cartelera_nueva:
+                cartelera_actual = cartelera_nueva
+                st.session_state[clave_backup_cartelera] = cartelera_nueva
+            else:
+                cartelera_actual = st.session_state.get(clave_backup_cartelera, cartelera_fecha)
+        else:
+            cartelera_actual = cartelera_fecha if cartelera_fecha else st.session_state.get(clave_backup_cartelera, [])
 
-        cartelera_actual = obtener_cartelera_por_fecha(fecha_str_api)
         ciclo_key = datetime.now(timezone(timedelta(hours=-5))).strftime("%H%M%S") if modo_vivo else "static"
 
         st.subheader(f"📅 Cartelera de Partidos (Hora de Ecuador - UTC-5) — Fecha: {fecha_seleccionada}")
