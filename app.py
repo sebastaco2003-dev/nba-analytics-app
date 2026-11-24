@@ -184,7 +184,7 @@ def buscar_noticias_web_nba(consulta, idioma="en", max_resultados=12):
                 fuente_el = item.find('source')
                 fuente = fuente_el.text if fuente_el is not None else "Google News"
 
-                titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ', 1 and ' - ' in titulo_raw else titulo_raw
+               titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ' in titulo_raw else titulo_raw
 
                 try:
                     dt_pub = datetime.strptime(pub_date[:25], "%a, %d %b %Y %H:%M:%S")
