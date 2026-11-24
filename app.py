@@ -1454,9 +1454,12 @@ def cargar_tickets_fecha_persistente(fecha_str):
     return None
 
 
-def guardar_tickets_fecha_persistente(fecha_str, tickets_dict):
+def guardar_tickets_fecha_persistente(fecha_str, tickets_dict, modo_guardado="Auto-Fijado"):
     if not tickets_dict or not any(tickets_dict.get(k) for k in ['ticket_1', 'ticket_2', 'ticket_3', 'ticket_4']):
         return
+    hora_ect = datetime.now(timezone(timedelta(hours=-5))).strftime("%H:%M:%S ECT")
+    tickets_dict['meta_fijado'] = f"{modo_guardado} a las {hora_ect}"
+
     almacen_global = obtener_almacen_global_tickets()
     almacen_global[fecha_str] = tickets_dict
 
@@ -1473,10 +1476,6 @@ def guardar_tickets_fecha_persistente(fecha_str, tickets_dict):
 
 
 def calcular_kelly_ticket(lista_picks, bankroll_usd=100.0):
-    """
-    Calcula la cuota decimal justa vs mercado estándar (-110 / 1.91 por pata)
-    y determina el Stake Óptimo mediante Criterio de Kelly Fraccionado (0.25x).
-    """
     if not lista_picks:
         return 1.0, 0.0, 0.0, 0.0
 
@@ -1485,7 +1484,6 @@ def calcular_kelly_ticket(lista_picks, bankroll_usd=100.0):
     for p in lista_picks:
         pr = max(min(float(p.get('prob_fija', 58.0)) / 100.0, 0.95), 0.30)
         edge_p = float(p.get('edge_fijo', 5.0)) / 100.0
-        # Estimación de probabilidad implícita de mercado = prob_modelo - edge
         prob_mercado = max(min(pr - edge_p, 0.90), 0.35)
         cuota_pata = 1.0 / prob_mercado
         prob_comb *= pr
@@ -1503,13 +1501,6 @@ def calcular_kelly_ticket(lista_picks, bankroll_usd=100.0):
 
 
 def calcular_confiabilidad_ticket(lista_picks):
-    """
-    Calcula el Índice de Confiabilidad (0 - 100 pts) combinando:
-    - 45% Media geométrica de probabilidades individuales
-    - 25% Edge promedio normalizado
-    - 20% Estabilidad y consistencia L10
-    - 10% Diversidad de encuentros + bonus estructural para dúos de 2 opciones
-    """
     if not lista_picks:
         return 0.0, "Sin datos", "#64748b", "rgba(100, 116, 139, 0.14)", "#ffffff"
 
@@ -1640,7 +1631,7 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
         edge_j = float(jug.get('_edge_num', 0.0))
         hr_j = float(jug.get('_hr_num', 0.0))
         estab_j = str(jug.get('_estab_txt', ''))
-        if edge_j < 4.5 or hr_j < 60.0 or "Volátil" in estab_j:
+        if edge_j < 3.5 or hr_j < 50.0 or "Volátil" in estab_j:
             continue
 
         try:
@@ -2702,17 +2693,28 @@ with tab_modelo:
 
             tickets_dia = cargar_tickets_fecha_persistente(fecha_busqueda_str)
 
-            col_tk_btn1, col_tk_btn2 = st.columns([1.8, 2.2])
-            with col_tk_btn1:
-                if st.button("🔒 Fijar / Regenerar Tickets con Alineaciones Actuales", key=f"regen_tk_{fecha_busqueda_str}"):
-                    nuevos_tk = construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores)
-                    guardar_tickets_fecha_persistente(fecha_busqueda_str, nuevos_tk)
-                    st.rerun()
-
             if tickets_dia is None:
                 nuevos_tk = construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores)
-                guardar_tickets_fecha_persistente(fecha_busqueda_str, nuevos_tk)
+                guardar_tickets_fecha_persistente(fecha_busqueda_str, nuevos_tk, modo_guardado="Fijado inicial")
                 tickets_dia = nuevos_tk
+
+            # --- BOTONES SEPARADOS: 1. FIJAR TICKETS ACTUALES | 2. REGENERAR CON ALINEACIONES ---
+            col_tk_btn1, col_tk_btn2, col_tk_info = st.columns([1.2, 1.5, 2.3])
+            with col_tk_btn1:
+                if st.button("🔒 Fijar Tickets Actuales", key=f"btn_fijar_tk_{fecha_busqueda_str}", use_container_width=True, type="primary"):
+                    guardar_tickets_fecha_persistente(fecha_busqueda_str, tickets_dia, modo_guardado="🔒 Fijado manual")
+                    st.toast("✅ Tickets fijados y bloqueados en memoria y disco.", icon="🔒")
+
+            with col_tk_btn2:
+                if st.button("🔄 Regenerar con Alineaciones Actuales", key=f"btn_regen_tk_{fecha_busqueda_str}", use_container_width=True):
+                    nuevos_tk = construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores)
+                    guardar_tickets_fecha_persistente(fecha_busqueda_str, nuevos_tk, modo_guardado="🔄 Regenerado")
+                    tickets_dia = nuevos_tk
+                    st.toast("🔄 Tickets regenerados con las alineaciones y bajas actuales.", icon="🔄")
+
+            with col_tk_info:
+                estado_fijado_txt = tickets_dia.get('meta_fijado', 'Fijado en sesión')
+                st.caption(f"📌 **Estado del Snapshot:** `{estado_fijado_txt}` (Los picks y líneas no cambiarán aunque avance el partido).")
 
             def renderizar_tarjeta_ticket(titulo_ticket, subtitulo_ticket, lista_picks, key_tabla):
                 if not lista_picks:
