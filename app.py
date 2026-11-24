@@ -184,7 +184,7 @@ def buscar_noticias_web_nba(consulta, idioma="en", max_resultados=12):
                 fuente_el = item.find('source')
                 fuente = fuente_el.text if fuente_el is not None else "Google News"
 
-                titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ' in titulo_raw else titulo_raw
+                titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ', 1 and ' - ' in titulo_raw else titulo_raw
 
                 try:
                     dt_pub = datetime.strptime(pub_date[:25], "%a, %d %b %Y %H:%M:%S")
@@ -1358,7 +1358,7 @@ def calcular_ajuste_vivo_capa4(
 
 
 # ==============================================================================
-# 5. COMPONENTES VISUALES Y MOTOR BLINDADO DE 4 TICKETS (2x3 + 2x2)
+# 5. COMPONENTES VISUALES Y MOTOR BLINDADO DE 4 TICKETS SIN REPETIR (2x2 + 2x3)
 # ==============================================================================
 
 def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
@@ -1394,24 +1394,34 @@ def obtener_html_badge_confianza(prob_rec):
     return f'<div class="badge-normal-conf">⚖️ Estándar ({prob_rec:.1f}% | Edge {edge_val:+.1f}%)</div>'
 
 
+@st.cache_resource
+def obtener_almacen_global_tickets():
+    # Persiste en memoria del servidor de Streamlit Cloud entre recargas
+    return {}
+
+
 def obtener_ruta_archivo_tickets_fecha(fecha_str):
     os.makedirs(CARPETA_TICKETS_DB, exist_ok=True)
     return os.path.join(CARPETA_TICKETS_DB, f"tickets_{fecha_str}.json")
 
 
 def cargar_tickets_fecha_persistente(fecha_str):
-    # 1. Revisar memoria activa de sesión
+    almacen_global = obtener_almacen_global_tickets()
+    if fecha_str in almacen_global and almacen_global[fecha_str]:
+        return almacen_global[fecha_str]
+
     store_mem = st.session_state.get('tickets_snapshot_store', {})
     if fecha_str in store_mem and store_mem[fecha_str]:
+        almacen_global[fecha_str] = store_mem[fecha_str]
         return store_mem[fecha_str]
 
-    # 2. Revisar archivo persistente en disco por fecha
     ruta = obtener_ruta_archivo_tickets_fecha(fecha_str)
     if os.path.exists(ruta):
         try:
             with open(ruta, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if data and any(data.get(k) for k in ['ticket_1', 'ticket_2', 'ticket_3', 'ticket_4']):
+                    almacen_global[fecha_str] = data
                     if 'tickets_snapshot_store' not in st.session_state:
                         st.session_state['tickets_snapshot_store'] = {}
                     st.session_state['tickets_snapshot_store'][fecha_str] = data
@@ -1424,9 +1434,13 @@ def cargar_tickets_fecha_persistente(fecha_str):
 def guardar_tickets_fecha_persistente(fecha_str, tickets_dict):
     if not tickets_dict or not any(tickets_dict.get(k) for k in ['ticket_1', 'ticket_2', 'ticket_3', 'ticket_4']):
         return
+    almacen_global = obtener_almacen_global_tickets()
+    almacen_global[fecha_str] = tickets_dict
+
     if 'tickets_snapshot_store' not in st.session_state:
         st.session_state['tickets_snapshot_store'] = {}
     st.session_state['tickets_snapshot_store'][fecha_str] = tickets_dict
+
     ruta = obtener_ruta_archivo_tickets_fecha(fecha_str)
     try:
         with open(ruta, "w", encoding="utf-8") as f:
@@ -1437,8 +1451,11 @@ def guardar_tickets_fecha_persistente(fecha_str, tickets_dict):
 
 def calcular_confiabilidad_ticket(lista_picks):
     """
-    Calcula el Índice de Confiabilidad (0 - 100 pts) premiando también
-    tickets compactos de 2 opciones (menor riesgo compuesto).
+    Calcula el Índice de Confiabilidad (0 - 100 pts) combinando:
+    - 45% Media geométrica de probabilidades individuales
+    - 25% Edge promedio normalizado
+    - 20% Estabilidad y consistencia L10
+    - 10% Diversidad de encuentros + bonus estructural para dúos de 2 opciones
     """
     if not lista_picks:
         return 0.0, "Sin datos", "#64748b", "rgba(100, 116, 139, 0.14)", "#ffffff"
@@ -1480,7 +1497,7 @@ def calcular_confiabilidad_ticket(lista_picks):
         puntajes_estab.append(base_s)
     s_estab = sum(puntajes_estab) / n
 
-    # 4. Diversidad + Bonus estructural por ticket corto de 2 patas (menor varianza acumulada)
+    # 4. Diversidad + Bonus estructural por ticket corto de 2 patas
     encuentros_unicos = len(set(p.get('encuentro', '') for p in lista_picks))
     i_div = 100.0 if encuentros_unicos == n else max(55.0, (encuentros_unicos / n) * 100.0)
     bonus_estructura = 3.5 if n == 2 else 0.0
@@ -1500,11 +1517,11 @@ def calcular_confiabilidad_ticket(lista_picks):
 
 def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
     """
-    Construye 4 tickets con alta confiabilidad:
-    - Ticket 1: 3 opciones (Élite Máxima Probabilidad)
-    - Ticket 2: 3 opciones (Alto Valor / Edge Sólido)
-    - Ticket 3: 2 opciones (Dúo Blindado - Top 2 más probables absolutas)
-    - Ticket 4: 2 opciones (Dúo Jugadores Consistentes - Top 2 jugadores con mejor L10 y Edge)
+    Construye 4 tickets con 10 selecciones TOTALMENTE DISTINTAS (sin repetir ni una sola):
+    - Ticket 1: 3 opciones (Triple Élite)
+    - Ticket 2: 3 opciones (Triple Alto Valor)
+    - Ticket 3: 2 opciones (Dúo Blindado — Top 2 más seguras)
+    - Ticket 4: 2 opciones (Dúo Jugadores Consistentes — Top 2 jugadores estables)
     """
     candidatos_pool = []
 
@@ -1622,7 +1639,7 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
             if len(elegidos) == tamano:
                 return elegidos
 
-        # Completar si faltan opciones
+        # Completar con picks no repetidos aunque compartan encuentro si la cartelera es corta
         for c in pool:
             if c['id_pick'] in excluir:
                 continue
@@ -1635,25 +1652,35 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
 
         return elegidos
 
-    # Ticket 1 (3 opciones): Top 3 absolutas de encuentros distintos
-    ticket_1 = seleccionar_picks(candidatos_pool, tamano=3)
-    ids_t1 = [p['id_pick'] for p in ticket_1]
+    usados_global = set()
 
-    # Ticket 2 (3 opciones): Siguientes 3 mejores oportunidades independientes
-    ticket_2 = seleccionar_picks(candidatos_pool, tamano=3, excluir_ids=ids_t1)
-    ids_t2 = [p['id_pick'] for p in ticket_2]
+    # 1. TICKET 3 (2 Opciones): Dúo Blindado — Top 2 selecciones más seguras de toda la jornada
+    ticket_3 = seleccionar_picks(candidatos_pool, tamano=2, excluir_ids=usados_global)
+    usados_global.update(p['id_pick'] for p in ticket_3)
 
-    # Ticket 3 (2 opciones): Dúo Blindado (las 2 selecciones más seguras de toda la jornada)
-    ticket_3 = seleccionar_picks(candidatos_pool, tamano=2)
-
-    # Ticket 4 (2 opciones): Dúo Jugadores Consistentes (top 2 jugadores más estables)
+    # 2. TICKET 4 (2 Opciones): Dúo Jugadores Consistentes — Top 2 jugadores estables (sin repetir)
     ticket_4 = seleccionar_picks(
         candidatos_pool,
         tamano=2,
+        excluir_ids=usados_global,
         filtro_fn=lambda c: "Jugador" in c['tipo']
     )
     if len(ticket_4) < 2:
-        ticket_4 = seleccionar_picks(candidatos_pool, tamano=2, excluir_ids=ids_t1 + ids_t2)
+        faltantes_t4 = seleccionar_picks(
+            candidatos_pool,
+            tamano=2 - len(ticket_4),
+            excluir_ids=usados_global
+        )
+        ticket_4.extend(faltantes_t4)
+    usados_global.update(p['id_pick'] for p in ticket_4)
+
+    # 3. TICKET 1 (3 Opciones): Triple Élite — Siguientes 3 mejores oportunidades distintas
+    ticket_1 = seleccionar_picks(candidatos_pool, tamano=3, excluir_ids=usados_global)
+    usados_global.update(p['id_pick'] for p in ticket_1)
+
+    # 4. TICKET 2 (3 Opciones): Triple Alto Valor — Siguientes 3 oportunidades distintas
+    ticket_2 = seleccionar_picks(candidatos_pool, tamano=3, excluir_ids=usados_global)
+    usados_global.update(p['id_pick'] for p in ticket_2)
 
     return {
         'ticket_1': ticket_1,
@@ -1970,7 +1997,7 @@ tab_modelo, tab_buscador = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: MOTOR PROBABILÍSTICO, CARTELERA, TABLAS Y 4 TICKETS BLINDADOS
+# PESTAÑA 1: MOTOR PROBABILÍSTICO, CARTELERA, TABLAS Y 4 TICKETS SIN REPETIR
 # ------------------------------------------------------------------------------
 with tab_modelo:
     @st.fragment(run_every=30 if modo_vivo else None)
@@ -2559,24 +2586,24 @@ with tab_modelo:
             st.markdown("---")
 
         # ======================================================================
-        # SIMULACIÓN DE 4 TICKETS BLINDADOS (2 DE 3 OPCIONES + 2 DE 2 OPCIONES)
+        # SIMULACIÓN DE 4 TICKETS BLINDADOS (10 OPCIONES ÚNICAS SIN REPETIR)
         # ======================================================================
         if resumen_equipos or resumen_jugadores:
-            st.subheader(f"🎟️ Simulación de 4 Tickets Blindados (2 Triples + 2 Dobles) — Fecha: {fecha_seleccionada}")
+            st.subheader(f"🎟️ Simulación de 4 Tickets Blindados (2 Triples + 2 Dobles Únicos) — Fecha: {fecha_seleccionada}")
             st.markdown(
-                "Las **selecciones quedan guardadas y bloqueadas permanentemente** para esta fecha (incluso al recargar o cambiar filtros). "
-                "Si **1 sola opción falla**, toda la tarjeta del ticket cambia automáticamente a **rojo**."
+                "Los 4 tickets contienen **10 selecciones totalmente distintas entre sí** (nunca repiten opciones) y quedan **guardados y congelados** para esta fecha. "
+                "Si **1 sola opción falla**, toda la tarjeta cambia automáticamente a **rojo**."
             )
 
             # --- TICKET DE EJEMPLO DIDÁCTICO ---
             with st.expander("📘 Guía Rápida: ¿Cómo leer los 4 Tickets, sus Colores y el Ticket de Ejemplo?"):
                 st.markdown("""
-                **1. Estructura de los 4 Tickets:**
-                * **Ticket 1 y Ticket 2 (3 opciones):** Combinadas de 3 encuentros distintos para multiplicar cuota manteniendo ventaja estadística.
-                * **Ticket 3 y Ticket 4 (2 opciones):** Combinadas cortas (*Dúos Blindados*) de solo 2 selecciones; al tener un leg menos, su **Índice de Confiabilidad y probabilidad de acierto son mucho mayores**.
+                **1. Estructura de los 4 Tickets (10 selecciones distintas sin repetir):**
+                * **Ticket 3 y Ticket 4 (2 opciones):** Combinadas cortas (*Dúos Blindados*) con las **2 selecciones de mayor probabilidad** y los **2 jugadores más consistentes**; al tener solo 2 patas, maximizan el **Índice de Confiabilidad**.
+                * **Ticket 1 y Ticket 2 (3 opciones):** Combinadas triples con las siguientes mejores oportunidades independientes del día.
 
                 **2. Regla de Color Dinámico:**
-                * **Antes o durante el partido:** El color de la tarjeta refleja el **Grado de Confiabilidad inicial** (Verde Esmeralda = `A+`, Verde Menta = `A`, Ámbar = `B`, Rojo = `C`).
+                * **Antes o durante el partido:** El color refleja el **Grado de Confiabilidad inicial** (`A+` Verde Esmeralda, `A` Verde Menta, `B` Ámbar, `C` Rojo).
                 * **Si falla cualquier selección:** La tarjeta completa cambia automáticamente a **Rojo (`❌ TICKET FALLADO`)**.
                 """)
 
@@ -2690,7 +2717,7 @@ with tab_modelo:
                 if fallos > 0:
                     banner_estado = f"❌ TICKET FALLADO ({aciertos}/{total_legs} acertadas | {fallos} fallada)"
                     color_borde_final = "#ef4444"
-                    bg_card_final = "rgba(239, 68, 68, 0.20)"
+                    bg_card_final = "rgba(239, 68, 68, 0.22)"
                 elif aciertos == total_legs and pendientes == 0 and en_vivo_cnt == 0:
                     banner_estado = f"🏆 TICKET GANADO ({aciertos}/{total_legs} ACERTADAS)"
                     color_borde_final = "#10b981"
@@ -2731,14 +2758,14 @@ with tab_modelo:
             with col_tk1:
                 renderizar_tarjeta_ticket(
                     "🎟️ TICKET 1 — Triple Élite (3 Opciones)",
-                    "Top 3 selecciones más seguras de encuentros distintos",
+                    "3 selecciones independientes de alta ventaja",
                     tickets_dia.get('ticket_1', []),
                     f"df_tk1_{fecha_busqueda_str}_{ciclo_key}"
                 )
             with col_tk2:
                 renderizar_tarjeta_ticket(
                     "🎟️ TICKET 2 — Triple Alto Valor (3 Opciones)",
-                    "Siguientes 3 mejores oportunidades independientes",
+                    "Siguientes 3 oportunidades únicas del día",
                     tickets_dia.get('ticket_2', []),
                     f"df_tk2_{fecha_busqueda_str}_{ciclo_key}"
                 )
@@ -2747,14 +2774,14 @@ with tab_modelo:
             with col_tk3:
                 renderizar_tarjeta_ticket(
                     "🎟️ TICKET 3 — Dúo Blindado (2 Opciones)",
-                    "Top 2 selecciones de máxima probabilidad de la jornada",
+                    "Top 2 selecciones más seguras de la jornada (sin repetir)",
                     tickets_dia.get('ticket_3', []),
                     f"df_tk3_{fecha_busqueda_str}_{ciclo_key}"
                 )
             with col_tk4:
                 renderizar_tarjeta_ticket(
                     "🎟️ TICKET 4 — Dúo Jugadores Consistentes (2 Opciones)",
-                    "Top 2 jugadores con mayor estabilidad L10 y Edge",
+                    "Top 2 jugadores con mayor estabilidad L10 y Edge (sin repetir)",
                     tickets_dia.get('ticket_4', []),
                     f"df_tk4_{fecha_busqueda_str}_{ciclo_key}"
                 )
