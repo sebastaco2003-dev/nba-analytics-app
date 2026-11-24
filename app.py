@@ -178,7 +178,6 @@ def buscar_noticias_web_nba(consulta, idioma="en", max_resultados=12):
         if resp.status_code == 200:
             root = ET.fromstring(resp.content)
             for item in root.findall('.//item')[:max_resultados]:
-               for item in root.findall('.//item')[:max_resultados]:
                 titulo_raw = item.findtext('title', default='')
                 link = item.findtext('link', default='')
                 pub_date = item.findtext('pubDate', default='')
@@ -186,6 +185,9 @@ def buscar_noticias_web_nba(consulta, idioma="en", max_resultados=12):
                 fuente = fuente_el.text if fuente_el is not None else "Google News"
 
                 titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ' in titulo_raw else titulo_raw
+
+                try:
+                    dt_pub = datetime.strptime(pub_date[:25], "%a, %d %b %Y %H:%M:%S")
                     dt_pub_ect = dt_pub - timedelta(hours=5)
                     fecha_fmt = dt_pub_ect.strftime("%d/%m %H:%M ECT")
                 except Exception:
@@ -256,7 +258,7 @@ def obtener_cartelera_por_fecha(fecha_str):
     url_scoreboard = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={fecha_str}"
     headers = {'User-Agent': 'Mozilla/5.0'}
     partidos = []
-   
+
     try:
         res = requests.get(url_scoreboard, headers=headers, timeout=10).json()
         for evento in res.get('events', []):
@@ -307,14 +309,14 @@ def obtener_cartelera_por_fecha(fecha_str):
             status_obj = evento.get('status', {})
             status_type = status_obj.get('type', {})
             estado_desc = status_type.get('shortDetail') or status_type.get('description', 'Programado')
-           
+
             if len(competidores) == 2:
                 t1 = competidores[0]
                 t2 = competidores[1]
-               
+
                 score_1 = t1.get('score', '0')
                 score_2 = t2.get('score', '0')
-               
+
                 partidos.append({
                     'event_id': str(evento.get('id')),
                     'dt_orden': dt_orden,
@@ -323,12 +325,12 @@ def obtener_cartelera_por_fecha(fecha_str):
                     'abrev_t1': t1.get('team', {}).get('abbreviation'),
                     'nombre_t1': t1.get('team', {}).get('displayName'),
                     'score_t1': int(score_1) if str(score_1).isdigit() else 0,
-                   
+
                     'id_t2': str(t2.get('team', {}).get('id')),
                     'abrev_t2': t2.get('team', {}).get('abbreviation'),
                     'nombre_t2': t2.get('team', {}).get('displayName'),
                     'score_t2': int(score_2) if str(score_2).isdigit() else 0,
-                   
+
                     'encuentro': f"{t1.get('team', {}).get('abbreviation')} vs {t2.get('team', {}).get('abbreviation')}",
                     'detalle': f"{t1.get('team', {}).get('displayName')} vs {t2.get('team', {}).get('displayName')}",
                     'estado': estado_desc,
@@ -339,11 +341,11 @@ def obtener_cartelera_por_fecha(fecha_str):
                     'bajas_evento_ids': list(bajas_evento_ids),
                     'bajas_evento_nombres': list(bajas_evento_nombres)
                 })
-       
+
         partidos = sorted(partidos, key=lambda x: x['dt_orden'])
     except Exception as e:
         print(f"Error cartelera fecha {fecha_str}: {e}")
-       
+
     return partidos
 
 
@@ -398,7 +400,7 @@ def obtener_metricas_avanzadas_equipos():
             try:
                 res_st = requests.get(url_stats, headers=headers, timeout=6).json()
                 categorias = res_st.get('results', {}).get('stats', {}).get('categories', [])
-                
+
                 stats_map = {}
                 for cat in categorias:
                     for st_item in cat.get('stats', []):
@@ -457,22 +459,22 @@ def obtener_mapa_jugadores_completo():
     headers = {'User-Agent': 'Mozilla/5.0'}
     mapa_jugadores = {}
     lesiones_liga = obtener_reporte_lesiones_liga()
-   
+
     try:
         res_eq = requests.get(url_equipos, headers=headers, timeout=10).json()
         for item in res_eq.get('sports', [{}])[0].get('leagues', [{}])[0].get('teams', []):
             id_equipo = str(item['team']['id'])
             nombre_equipo = item['team']['displayName']
             abrev_equipo = item['team']['abbreviation']
-           
+
             url_roster = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{id_equipo}/roster"
             res_roster = requests.get(url_roster, headers=headers, timeout=5).json()
-           
+
             for atleta in res_roster.get('athletes', []):
                 nombre_completo = atleta.get('fullName', '')
                 id_atleta = str(atleta.get('id', ''))
                 status_roster = atleta.get('status', {}).get('name', 'Active') or 'Active'
-                
+
                 status_lesion_global = lesiones_liga.get(id_atleta, '')
                 if status_lesion_global and es_estatus_baja(status_lesion_global):
                     status_final = f"Out ({status_lesion_global})"
@@ -482,7 +484,7 @@ def obtener_mapa_jugadores_completo():
                     status_final = status_roster
 
                 pos_abrev = atleta.get('position', {}).get('abbreviation', 'F')
-               
+
                 if nombre_completo and id_atleta:
                     mapa_jugadores[nombre_completo] = {
                         'id': id_atleta,
@@ -494,7 +496,7 @@ def obtener_mapa_jugadores_completo():
                     }
     except Exception as e:
         print(f"Error roster: {e}")
-       
+
     return mapa_jugadores
 
 
@@ -502,7 +504,7 @@ def obtener_mapa_jugadores_completo():
 def consultar_gamelog_jugador(id_espn):
     url_gamelog = f"https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/{id_espn}/gamelog"
     headers = {'User-Agent': 'Mozilla/5.0'}
-   
+
     try:
         respuesta = requests.get(url_gamelog, headers=headers, timeout=10).json()
         nombres_columnas = respuesta.get('names', [])
@@ -515,7 +517,7 @@ def consultar_gamelog_jugador(id_espn):
                     id_partido = evento.get('eventId')
                     stats = dict(zip(nombres_columnas, evento.get('stats', [])))
                     info_partido = eventos_dict.get(id_partido, {})
-                   
+
                     fecha_raw = info_partido.get('gameDate', '')[:10]
                     minutos_str = str(stats.get('minutes', 0))
                     try:
@@ -555,12 +557,21 @@ def obtener_historial_previo_sin_leakage(df_jugador, fecha_limite_str):
 
 def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
     if df_jugador_previo is None or df_jugador_previo.empty:
-        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'pra': 23.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
+        return {
+            'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'pra': 23.0,
+            'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11,
+            'momentum_tag': '➡️ Neutro', 'momentum_delta_pct': 0.0
+        }
 
     df_v = df_jugador_previo[df_jugador_previo['MIN'] > 0]
     if df_v.empty:
-        return {'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'pra': 23.0, 'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11}
+        return {
+            'min': 28.0, 'pts': 15.0, 'reb': 5.0, 'ast': 3.0, 'pra': 23.0,
+            'tasa_pts': 0.50, 'tasa_reb': 0.18, 'tasa_ast': 0.11,
+            'momentum_tag': '➡️ Neutro', 'momentum_delta_pct': 0.0
+        }
 
+    df_3 = df_v.head(3)
     df_5 = df_v.head(5)
     df_10 = df_v.head(10)
 
@@ -575,6 +586,17 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
     reb_p = pond_col('REB')
     ast_p = pond_col('AST')
     pra_p = pond_col('PRA') if 'PRA' in df_v.columns else (pts_p + reb_p + ast_p)
+
+    # Radar de Momentum L3 vs Temporada (PRA)
+    pra_season = float((df_v['PTS'] + df_v['REB'] + df_v['AST']).mean())
+    pra_l3 = float((df_3['PTS'] + df_3['REB'] + df_3['AST']).mean())
+    delta_mom = ((pra_l3 - pra_season) / max(pra_season, 1.0)) * 100.0
+    if delta_mom >= 14.0:
+        mom_tag = f"🔥 Racha (+{delta_mom:.0f}%)"
+    elif delta_mom <= -14.0:
+        mom_tag = f"❄️ Bajón ({delta_mom:.0f}%)"
+    else:
+        mom_tag = f"➡️ Estable ({delta_mom:+.0f}%)"
 
     tasa_pts_5 = df_5['PTS'].sum() / max(df_5['MIN'].sum(), 1.0)
     tasa_pts_10 = df_10['PTS'].sum() / max(df_10['MIN'].sum(), 1.0)
@@ -596,7 +618,9 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
         'pra': round(pra_p, 1),
         'tasa_pts': tasa_pts,
         'tasa_reb': tasa_reb,
-        'tasa_ast': tasa_ast
+        'tasa_ast': tasa_ast,
+        'momentum_tag': mom_tag,
+        'momentum_delta_pct': round(delta_mom, 1)
     }
 
 
@@ -1092,6 +1116,7 @@ def calcular_proyeccion_jugador_capa2_3(
         'factor_rival': round(factor_rival, 3),
         'factor_usage_bump': round(factor_usage_bump, 3),
         'factor_fatiga': round(factor_fatiga_eficiencia, 3),
+        'momentum_tag': st_pond['momentum_tag'],
         'lambda_pts': round(lambda_pts, 2),
         'prob_more_pts': round(prob_more_pts, 1),
         'prob_less_pts': round(prob_less_pts, 1),
@@ -1145,25 +1170,25 @@ def obtener_datos_en_vivo_espn(event_id):
         return None
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={event_id}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    
+
     try:
         res = requests.get(url, headers=headers, timeout=8).json()
         header_comp = res.get("header", {}).get("competitions", [{}])[0]
         status_obj = header_comp.get("status", {})
         status_type = status_obj.get("type", {})
-        
+
         estado_tipo = status_type.get("state", "pre")
         detalle_estado = status_type.get("shortDetail") or status_type.get("description", "")
         cuarto = int(status_obj.get("period", 1))
         reloj_str = status_obj.get("displayClock", "12:00")
         min_reloj = parsear_reloj_a_minutos(reloj_str)
-        
+
         competidores = header_comp.get("competitors", [])
         marcadores = {}
         for comp in competidores:
             abrev = comp.get("team", {}).get("abbreviation", "")
             marcadores[abrev] = int(comp.get("score", 0)) if str(comp.get("score", "0")).isdigit() else 0
-            
+
         if estado_tipo == "pre":
             min_restantes_partido = 48.0
         elif estado_tipo == "post":
@@ -1177,22 +1202,22 @@ def obtener_datos_en_vivo_espn(event_id):
         stats_por_id = {}
         stats_por_nombre_norm = {}
         boxscore = res.get("boxscore", {}).get("players", [])
-        
+
         for equipo_box in boxscore:
             abrev_eq = equipo_box.get("team", {}).get("abbreviation", "")
             estadisticas_lista = equipo_box.get("statistics", [])
-            
+
             for bloque_stats in estadisticas_lista:
                 nombres_cols = bloque_stats.get("names", [])
                 atletas = bloque_stats.get("athletes", [])
-                
+
                 for atl in atletas:
                     info_atl = atl.get("athlete", {})
                     nombre = info_atl.get("displayName", "")
                     id_atl = str(info_atl.get("id", ""))
                     valores = atl.get("stats", [])
                     did_not_play = atl.get("didNotPlay", False)
-                    
+
                     if valores and len(valores) == len(nombres_cols):
                         mapa_s = dict(zip(nombres_cols, valores))
                         min_jugados = parsear_minutos_jugados_boxscore(mapa_s.get("MIN", 0))
@@ -1229,7 +1254,7 @@ def obtener_datos_en_vivo_espn(event_id):
                         stats_por_id[id_atl] = registro_vivo
                     if nombre:
                         stats_por_nombre_norm[normalizar_texto(nombre)] = registro_vivo
-                    
+
         return {
             "estado": estado_tipo,
             "detalle_estado": detalle_estado,
@@ -1269,11 +1294,11 @@ def calcular_ajuste_vivo_capa4(
         j_vivo = datos_vivo["jugadores_por_nombre"].get(normalizar_texto(nombre_jugador))
     if not j_vivo:
         return None
-        
+
     cuarto = datos_vivo["cuarto"]
     min_reloj = datos_vivo["min_reloj"]
     min_restantes_partido = datos_vivo["min_restantes_partido"]
-    
+
     st_p = calcular_estadisticas_ponderadas_jugador(df_historial)
     tasa_pts = st_p['tasa_pts'] * factor_ritmo * factor_rival * factor_usage_bump
     tasa_reb = st_p['tasa_reb'] * factor_ritmo
@@ -1284,10 +1309,10 @@ def calcular_ajuste_vivo_capa4(
 
     ratio_rotacion = min(minutos_proyectados_totales / 48.0, 1.0)
     min_restantes_jugador = min(min_restantes_partido * ratio_rotacion, min_restantes_partido)
-    
+
     alertas = []
     factor_multiplicador = 1.0
-    
+
     faltas = j_vivo["FALTAS"]
     en_foul_trouble = (
         (cuarto == 1 and faltas >= 2) or
@@ -1300,13 +1325,13 @@ def calcular_ajuste_vivo_capa4(
 
     scores = list(datos_vivo["marcadores"].values())
     diferencia = abs(scores[0] - scores[1]) if len(scores) == 2 else 0
-    
+
     en_blowout = False
     if cuarto == 4 and min_reloj >= 6.0 and diferencia >= 20:
         en_blowout = True
     elif cuarto >= 4 and min_reloj < 6.0 and diferencia >= 15:
         en_blowout = True
-        
+
     if en_blowout and min_restantes_partido > 0:
         factor_multiplicador *= (1.0 - penalizacion_blowout)
         alertas.append(f"🚨 Blowout Factor (Diferencia de {diferencia} pts en Q{cuarto}): -{int(penalizacion_blowout*100)}% min titulares")
@@ -1319,7 +1344,7 @@ def calcular_ajuste_vivo_capa4(
 
     fraccion_tiempo_restante = max(min_restantes_ajustados / max(minutos_proyectados_totales, 1.0), 0.05)
     std_pts_restante = std_pts_hist * np.sqrt(fraccion_tiempo_restante)
-    
+
     if j_vivo["PTS_ACTUAL"] > linea_pts:
         prob_over_pts = 100.0
     elif min_restantes_ajustados == 0:
@@ -1356,7 +1381,7 @@ def calcular_ajuste_vivo_capa4(
 
 
 # ==============================================================================
-# 5. COMPONENTES VISUALES Y MOTOR BLINDADO DE 4 TICKETS SIN REPETIR (2x2 + 2x3)
+# 5. COMPONENTES VISUALES, GESTIÓN DE BANKROLL (KELLY) Y 4 TICKETS SIN REPETIR
 # ==============================================================================
 
 def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
@@ -1447,6 +1472,36 @@ def guardar_tickets_fecha_persistente(fecha_str, tickets_dict):
         pass
 
 
+def calcular_kelly_ticket(lista_picks, bankroll_usd=100.0):
+    """
+    Calcula la cuota decimal justa vs mercado estándar (-110 / 1.91 por pata)
+    y determina el Stake Óptimo mediante Criterio de Kelly Fraccionado (0.25x).
+    """
+    if not lista_picks:
+        return 1.0, 0.0, 0.0, 0.0
+
+    prob_comb = 1.0
+    cuota_mercado_est = 1.0
+    for p in lista_picks:
+        pr = max(min(float(p.get('prob_fija', 58.0)) / 100.0, 0.95), 0.30)
+        edge_p = float(p.get('edge_fijo', 5.0)) / 100.0
+        # Estimación de probabilidad implícita de mercado = prob_modelo - edge
+        prob_mercado = max(min(pr - edge_p, 0.90), 0.35)
+        cuota_pata = 1.0 / prob_mercado
+        prob_comb *= pr
+        cuota_mercado_est *= cuota_pata
+
+    b = max(cuota_mercado_est - 1.0, 0.1)
+    q = 1.0 - prob_comb
+    kelly_full = ((b * prob_comb) - q) / b
+    kelly_frac_pct = max(min(kelly_full * 0.25 * 100.0, 8.0), 0.5) if kelly_full > 0 else 0.5
+
+    stake_usd = round((kelly_frac_pct / 100.0) * bankroll_usd, 2)
+    retorno_potencial = round(stake_usd * cuota_mercado_est, 2)
+
+    return round(cuota_mercado_est, 2), round(kelly_frac_pct, 1), stake_usd, retorno_potencial
+
+
 def calcular_confiabilidad_ticket(lista_picks):
     """
     Calcula el Índice de Confiabilidad (0 - 100 pts) combinando:
@@ -1462,17 +1517,14 @@ def calcular_confiabilidad_ticket(lista_picks):
     probs = [max(min(float(p.get('prob_fija', 55.0)), 95.0), 30.0) for p in lista_picks]
     edges = [max(float(p.get('edge_fijo', 0.0)), 0.0) for p in lista_picks]
 
-    # 1. Media geométrica de probabilidades individuales
     prod_p = 1.0
     for pr in probs:
         prod_p *= (pr / 100.0)
     p_geom = (prod_p ** (1.0 / n)) * 100.0
 
-    # 2. Edge promedio normalizado (tope en +12%)
     edge_prom = sum(edges) / n
     e_norm = min((edge_prom / 12.0) * 100.0, 100.0)
 
-    # 3. Estabilidad y consistencia
     puntajes_estab = []
     for p in lista_picks:
         proy_txt = str(p.get('proyeccion_fija', ''))
@@ -1495,7 +1547,6 @@ def calcular_confiabilidad_ticket(lista_picks):
         puntajes_estab.append(base_s)
     s_estab = sum(puntajes_estab) / n
 
-    # 4. Diversidad + Bonus estructural por ticket corto de 2 patas
     encuentros_unicos = len(set(p.get('encuentro', '') for p in lista_picks))
     i_div = 100.0 if encuentros_unicos == n else max(55.0, (encuentros_unicos / n) * 100.0)
     bonus_estructura = 3.5 if n == 2 else 0.0
@@ -1637,7 +1688,6 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
             if len(elegidos) == tamano:
                 return elegidos
 
-        # Completar con picks no repetidos aunque compartan encuentro si la cartelera es corta
         for c in pool:
             if c['id_pick'] in excluir:
                 continue
@@ -1695,10 +1745,6 @@ def evaluar_estado_actual_pick_congelado(
     catalogo_jugadores,
     fecha_busqueda_str
 ):
-    """
-    Evalúa el estado real/en vivo de cada pick congelado de manera independiente
-    a los filtros del sidebar, consultando directamente la cartelera y el gamelog.
-    """
     tipo = pick.get('tipo', '')
     enc = pick.get('encuentro', '')
     partido_info = mapa_cartelera_encuentros.get(enc)
@@ -1764,7 +1810,6 @@ def evaluar_estado_actual_pick_congelado(
         estado_txt = partido_info.get('estado', '')
         es_final = (estado_cod == 'post') or (str(estado_txt).lower() in ['finalized', 'final', 'closed'])
 
-        # 1. Revisar en Boxscore oficial en vivo / finalizado
         if datos_vivo:
             jv = datos_vivo.get("jugadores_por_id", {}).get(id_j) or datos_vivo.get("jugadores_por_nombre", {}).get(normalizar_texto(nom_j))
             if jv:
@@ -1793,7 +1838,6 @@ def evaluar_estado_actual_pick_congelado(
                         return f"🔴 {val_v} {merc_fijo} ({box_s})", "🔴 Superada en contra"
                     return f"🔴 {val_v} {merc_fijo} ({box_s})", f"⏳ En juego ({estado_txt})"
 
-        # 2. Respaldo en Gamelog histórico si el partido ya finalizó
         if es_final and id_j:
             df_j = consultar_gamelog_jugador(id_j)
             if df_j is not None and not df_j.empty:
@@ -1822,7 +1866,7 @@ def evaluar_estado_actual_pick_congelado(
 # ==============================================================================
 
 st.title("🏀 NBA Real-Time Analytics & Backtesting Engine")
-st.markdown("Motor Probabilístico Institucional + **Buscador Web en Vivo de Noticias y Sincronización Directa de Bajas**.")
+st.markdown("Motor Probabilístico Institucional + **Radar de Momentum L3** + **Gestor de Bankroll (Kelly)**.")
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
@@ -1945,6 +1989,10 @@ if st.session_state['bajas_manuales_out_state'] or st.session_state['altas_manua
         st.rerun()
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("💰 Gestor de Bankroll (Kelly 0.25x)")
+bankroll_usuario = st.sidebar.number_input("Capital / Bankroll Total ($ USD)", min_value=10.0, max_value=100000.0, value=100.0, step=10.0)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Filtros de Calidad de Mercado")
 filtro_equipos_modo = st.sidebar.selectbox(
     "Filtrar Tabla de Partidos (Equipos)",
@@ -2064,7 +2112,7 @@ with tab_modelo:
                     pts_prom = st_p['pts']
                     reb_prom = st_p['reb']
                     ast_prom = st_p['ast']
-                   
+
                     if min_prom >= 18.0:
                         score_jerarquia = pts_prom * 1.25 + reb_prom + ast_prom
                         candidatos.append((
@@ -2172,7 +2220,7 @@ with tab_modelo:
                         txt_b2 = f"**{partido['abrev_t2']} OUT:** {', '.join([b['nombre'] for b in bajas_t2])}" if bajas_t2 else ""
                         separador = " | " if (txt_b1 and txt_b2) else ""
                         st.warning(f"🏥 **Bajas excluidas automáticamente (Capa 5 activa):** {txt_b1}{separador}{txt_b2}")
-                   
+
                     jugadores_t1 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t1_id]
                     jugadores_t2 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t2_id]
 
@@ -2274,6 +2322,7 @@ with tab_modelo:
                                 'Encuentro': partido['encuentro'],
                                 'Jugador': nom_j,
                                 'Equipo': abrev_eq,
+                                'Momentum L3': proy['momentum_tag'],
                                 'Mercado': tipo_m,
                                 'Min Proy.': round(min_eval, 1),
                                 'Λ Proy.': lambda_m,
@@ -2295,9 +2344,9 @@ with tab_modelo:
 
                     procesar_jugadores_equipo_resumen(top_t1, partido['abrev_t1'], ajustes_t1, t1_b2b, ctx_partido['eq2_stats']['def_rtg'])
                     procesar_jugadores_equipo_resumen(top_t2, partido['abrev_t2'], ajustes_t2, t2_b2b, ctx_partido['eq1_stats']['def_rtg'])
-                   
+
                     col_p1, col_p2 = st.columns(2)
-                   
+
                     with col_p1:
                         if top_t1:
                             nom_1, pts_1, reb_1, ast_1, min_1, stat_1, id_1, df_j1_full, df_j1_prev = top_t1[0]
@@ -2322,7 +2371,7 @@ with tab_modelo:
                                 st.markdown(obtener_html_badge_confianza(mm1['prob']), unsafe_allow_html=True)
                                 st.markdown(
                                     f"**Mejor Mercado:** `{mm1['direccion']} {mm1['linea']} {mm1['mercado']}` (Λ: {mm1['lambda']}) | "
-                                    f"**Hit Rate L10:** {int(mm1['hit_rate'])}% | **Estabilidad:** {mm1['estabilidad']}"
+                                    f"**Hit Rate L10:** {int(mm1['hit_rate'])}% | **Momentum L3:** {proy_1['momentum_tag']}"
                                 )
                                 st.metric(
                                     f"Proyección Completa ({lineas_auto_1['pts']}P / {lineas_auto_1['reb']}R / {lineas_auto_1['ast']}A / {lineas_auto_1['pra']} PRA)",
@@ -2358,7 +2407,7 @@ with tab_modelo:
                                 st.markdown(obtener_html_badge_confianza(mm2['prob']), unsafe_allow_html=True)
                                 st.markdown(
                                     f"**Mejor Mercado:** `{mm2['direccion']} {mm2['linea']} {mm2['mercado']}` (Λ: {mm2['lambda']}) | "
-                                    f"**Hit Rate L10:** {int(mm2['hit_rate'])}% | **Estabilidad:** {mm2['estabilidad']}"
+                                    f"**Hit Rate L10:** {int(mm2['hit_rate'])}% | **Momentum L3:** {proy_2['momentum_tag']}"
                                 )
                                 st.metric(
                                     f"Proyección Completa ({lineas_auto_2['pts']}P / {lineas_auto_2['reb']}R / {lineas_auto_2['ast']}A / {lineas_auto_2['pra']} PRA)",
@@ -2369,7 +2418,7 @@ with tab_modelo:
                                     st.rerun()
                         else:
                             st.info(f"Sin jugadores sanos activos para {partido['abrev_t2']}")
-                   
+
                     prob_t1 = ctx_partido['prob_t1']
                     prob_t2 = ctx_partido['prob_t2']
                     total_proyectado_partido = ctx_partido['total_proyectado']
@@ -2409,7 +2458,7 @@ with tab_modelo:
                         ganador_real = partido['abrev_t1'] if s1 > s2 else partido['abrev_t2']
                         cumplio_total = evaluar_resultado_linea(total_actual, linea_ou_partido, verdict_partido_total)
                         acerto_ganador = "🟢 Acierto" if ganador_recomendado == ganador_real else "🔴 Fallo"
-                       
+
                         resumen_equipos.append({
                             'Nivel': clasif_eq['nivel'],
                             'Mercado Operable': clasif_eq['mercado_operable'],
@@ -2519,7 +2568,7 @@ with tab_modelo:
                 f"Separa automáticamente **💎 Doble Edge**, **🎯 Edge Solo Total (O/U)** y **🏆 Edge Solo Ganador (ML)** "
                 f"(umbral mínimo **Edge ≥ +{UMBRAL_EDGE_OPERABLE:.1f}%**)."
             )
-           
+
             df_equipos = pd.DataFrame(resumen_equipos)
             df_equipos['_en_vivo_prio'] = df_equipos['Estado'].astype(str).str.contains("🔴", na=False).astype(int)
             df_equipos = df_equipos.sort_values(by=['_en_vivo_prio', '_score_orden'], ascending=[False, False])
@@ -2550,11 +2599,11 @@ with tab_modelo:
 
         # --- RESUMEN EJECUTIVO DE JUGADORES ---
         if resumen_jugadores:
-            st.subheader("⭐ Resumen Ejecutivo: Mejores Mercados de Jugadores (Ordenados por Calidad)")
+            st.subheader("⭐ Resumen Ejecutivo: Mejores Mercados de Jugadores (Con Radar Momentum L3)")
             st.markdown(
-                "Ordenado automáticamente de **mayor a menor calidad estadística** combinando **Edge %**, **Hit Rate L10** y **Estabilidad (CV%)**."
+                "Ordenado automáticamente de **mayor a menor calidad estadística** combinando **Edge %**, **Hit Rate L10**, **Estabilidad (CV%)** y **Momentum L3**."
             )
-           
+
             df_jugadores_res = pd.DataFrame(resumen_jugadores)
             df_jugadores_res['_en_vivo_prio'] = df_jugadores_res['Real / Vivo'].astype(str).str.contains("🔴", na=False).astype(int)
             df_jugadores_res = df_jugadores_res.sort_values(by=['_en_vivo_prio', '_score_calidad'], ascending=[False, False])
@@ -2584,25 +2633,26 @@ with tab_modelo:
             st.markdown("---")
 
         # ======================================================================
-        # SIMULACIÓN DE 4 TICKETS BLINDADOS (10 OPCIONES ÚNICAS SIN REPETIR)
+        # SIMULACIÓN DE 4 TICKETS BLINDADOS (10 OPCIONES ÚNICAS + KELLY BANKROLL)
         # ======================================================================
         if resumen_equipos or resumen_jugadores:
-            st.subheader(f"🎟️ Simulación de 4 Tickets Blindados (2 Triples + 2 Dobles Únicos) — Fecha: {fecha_seleccionada}")
+            st.subheader(f"🎟️ Simulación de 4 Tickets Blindados (10 Picks Únicos + Kelly Bankroll) — Fecha: {fecha_seleccionada}")
             st.markdown(
-                "Los 4 tickets contienen **10 selecciones totalmente distintas entre sí** (nunca repiten opciones) y quedan **guardados y congelados** para esta fecha. "
+                f"Los 4 tickets contienen **10 selecciones totalmente distintas entre sí** (nunca repiten opciones) con gestión de capital **Kelly Fraccionado (0.25x)** sobre tu bankroll de **${bankroll_usuario:,.2f} USD**. "
                 "Si **1 sola opción falla**, toda la tarjeta cambia automáticamente a **rojo**."
             )
 
-            # --- TICKET DE EJEMPLO DIDÁCTICO ---
-            with st.expander("📘 Guía Rápida: ¿Cómo leer los 4 Tickets, sus Colores y el Ticket de Ejemplo?"):
+            with st.expander("📘 Guía Rápida: ¿Cómo leer los 4 Tickets, Criterio de Kelly y el Ticket de Ejemplo?"):
                 st.markdown("""
                 **1. Estructura de los 4 Tickets (10 selecciones distintas sin repetir):**
                 * **Ticket 3 y Ticket 4 (2 opciones):** Combinadas cortas (*Dúos Blindados*) con las **2 selecciones de mayor probabilidad** y los **2 jugadores más consistentes**; al tener solo 2 patas, maximizan el **Índice de Confiabilidad**.
                 * **Ticket 1 y Ticket 2 (3 opciones):** Combinadas triples con las siguientes mejores oportunidades independientes del día.
 
-                **2. Regla de Color Dinámico:**
-                * **Antes o durante el partido:** El color refleja el **Grado de Confiabilidad inicial** (`A+` Verde Esmeralda, `A` Verde Menta, `B` Ámbar, `C` Rojo).
-                * **Si falla cualquier selección:** La tarjeta completa cambia automáticamente a **Rojo (`❌ TICKET FALLADO`)**.
+                **2. Gestión de Bankroll (Kelly 0.25x):**
+                * Calcula automáticamente el **Stake Sugerido ($)** proporcional al *Edge* y la probabilidad real de cada ticket para proteger tu capital frente a la varianza.
+
+                **3. Regla de Color Dinámico:**
+                * Si falla cualquier selección, la tarjeta completa cambia automáticamente a **Rojo (`❌ TICKET FALLADO`)**.
                 """)
 
                 st.markdown("""
@@ -2611,7 +2661,7 @@ with tab_modelo:
                             <div>
                                 <h4 style="margin: 0; color: #ffffff;">📘 TICKET DE EJEMPLO (Dúo Blindado de 2 Opciones)</h4>
                                 <span style="font-size: 13px; color: #cbd5e1;">
-                                    Confiabilidad: <b style="color: #34d399;">91.2 / 100 pts</b> • Prob. Combinada: <b>58.4%</b>
+                                    Confiabilidad: <b style="color: #34d399;">91.2 / 100 pts</b> • Prob. Combinada: <b>58.4%</b> • Stake Kelly: <b>$4.50</b> (Retorno Est.: <b>$11.90</b>)
                                 </span>
                             </div>
                             <div style="display: flex; gap: 8px; flex-wrap: wrap;">
@@ -2670,6 +2720,7 @@ with tab_modelo:
                     return
 
                 score_conf, grado_conf, color_borde_conf, bg_card_conf, color_txt_badge_conf = calcular_confiabilidad_ticket(lista_picks)
+                cuota_est, kelly_pct, stake_usd, retorno_usd = calcular_kelly_ticket(lista_picks, bankroll_usuario)
 
                 filas_tk = []
                 aciertos = 0
@@ -2711,7 +2762,6 @@ with tab_modelo:
                 total_legs = len(lista_picks)
                 prob_comb_pct = round(prob_combinada * 100.0, 1)
 
-                # Si falla al menos 1 opción, toda la tarjeta cambia inmediatamente a ROJO
                 if fallos > 0:
                     banner_estado = f"❌ TICKET FALLADO ({aciertos}/{total_legs} acertadas | {fallos} fallada)"
                     color_borde_final = "#ef4444"
@@ -2737,6 +2787,9 @@ with tab_modelo:
                                 <span style="font-size: 13px; color: #cbd5e1;">
                                     {subtitulo_ticket} • Confiabilidad: <b style="color: {color_borde_conf};">{score_conf}/100 pts</b> • Prob. Combinada: <b>{prob_comb_pct}%</b>
                                 </span>
+                                <div style="font-size: 12px; color: #e2e8f0; margin-top: 4px;">
+                                    💰 <b>Kelly (0.25x):</b> {kelly_pct}% (<b>${stake_usd:,.2f}</b>) • Cuota Est.: <b>{cuota_est}x</b> • Retorno Potencial: <b style="color: #34d399;">${retorno_usd:,.2f}</b>
+                                </div>
                             </div>
                             <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
                                 <span style="font-weight: 800; font-size: 12px; padding: 5px 11px; border-radius: 999px; background-color: {color_borde_conf}; color: {color_txt_badge_conf};">
@@ -2926,14 +2979,14 @@ with tab_modelo:
                         if res_vivo:
                             for alerta in res_vivo["alertas"]:
                                 st.warning(alerta)
-                                
+
                             act = res_vivo["actual"]
                             st.caption(
                                 f"📊 **Progreso Actual en Cancha:** **{act['PTS_ACTUAL']} PTS, {act['REB_ACTUAL']} REB, {act['AST_ACTUAL']} AST ({act['PRA_ACTUAL']} PRA)** "
                                 f"en {act['MIN_ACTUAL']:.1f} min ({act['FALTAS']} faltas) | "
                                 f"Minutos restantes estimados: **{res_vivo['min_restantes_ajustados']} min**"
                             )
-                            
+
                             c1, c2, c3 = st.columns(3)
                             with c1:
                                 st.metric(
@@ -2969,7 +3022,7 @@ with tab_modelo:
                     st.success(
                         f"🏆 **Mejor Mercado Recomendado:** **{mm_j['direccion']} {mm_j['linea']} {mm_j['mercado']}** "
                         f"(Λ: {mm_j['lambda']} | Prob: {mm_j['prob']}% | **Edge {mm_j['edge']:+.1f}%** | "
-                        f"Hit Rate L10: **{int(mm_j['hit_rate'])}%** | Estabilidad: **{mm_j['estabilidad']}**)"
+                        f"Hit Rate L10: **{int(mm_j['hit_rate'])}%** | Momentum L3: **{proy_detallada['momentum_tag']}**)"
                     )
                     st.caption(
                         f"⚙️ **Contexto Aplicado:** Minutos Proyectados = **{minutos_proyectados_final:.1f} min** | "
