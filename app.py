@@ -178,16 +178,14 @@ def buscar_noticias_web_nba(consulta, idioma="en", max_resultados=12):
         if resp.status_code == 200:
             root = ET.fromstring(resp.content)
             for item in root.findall('.//item')[:max_resultados]:
+               for item in root.findall('.//item')[:max_resultados]:
                 titulo_raw = item.findtext('title', default='')
                 link = item.findtext('link', default='')
                 pub_date = item.findtext('pubDate', default='')
                 fuente_el = item.find('source')
                 fuente = fuente_el.text if fuente_el is not None else "Google News"
 
-               titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ' in titulo_raw else titulo_raw
-
-                try:
-                    dt_pub = datetime.strptime(pub_date[:25], "%a, %d %b %Y %H:%M:%S")
+                titulo_limpio = titulo_raw.rsplit(' - ', 1)[0] if ' - ' in titulo_raw else titulo_raw
                     dt_pub_ect = dt_pub - timedelta(hours=5)
                     fecha_fmt = dt_pub_ect.strftime("%d/%m %H:%M ECT")
                 except Exception:
