@@ -130,9 +130,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Constantes de Calibración y Mercado
-UMBRAL_ALTA_CONFIANZA = 58.0
+UMBRAL_ALTA_CONFIANZA = 58.5
 BREAK_EVEN_ODDS_110 = 52.38
 UMBRAL_EDGE_OPERABLE = 5.0
+VENTAJA_LOCALIA_PTS = 2.9  # Ventaja estadística real de localía en NBA
 CARPETA_TICKETS_DB = "tickets_db"
 
 ESTATUS_NO_DISPONIBLE = [
@@ -250,8 +251,20 @@ def obtener_tabla_completa_lesiones_nba():
 
 
 # ==============================================================================
-# 1. EXTRACCIÓN DE DATOS BASE (CARTELERA, REPORTES MÉDICOS, B2B Y ROSTERS)
+# 1. EXTRACCIÓN DE DATOS BASE (CARTELERA, REPORTES MÉDICOS, ODDS Y ROSTERS)
 # ==============================================================================
+
+def american_odds_a_prob(odds_val):
+    try:
+        o = float(odds_val)
+        if o < 0:
+            return abs(o) / (abs(o) + 100.0)
+        elif o > 0:
+            return 100.0 / (o + 100.0)
+    except Exception:
+        pass
+    return None
+
 
 @st.cache_data(ttl=20)
 def obtener_cartelera_por_fecha(fecha_str):
@@ -278,19 +291,34 @@ def obtener_cartelera_por_fecha(fecha_str):
             odds_list = competitions.get('odds', [])
             linea_mercado_ou = None
             spread_mercado = None
+            spread_t1_firmado = None  # Negativo = t1 favorito por spread_mercado
+            prob_mercado_t1 = None
+
             if odds_list and isinstance(odds_list, list):
-                ou_val = odds_list[0].get('overUnder')
+                odd0 = odds_list[0]
+                ou_val = odd0.get('overUnder')
                 if ou_val is not None:
                     try:
                         linea_mercado_ou = float(ou_val)
                     except (ValueError, TypeError):
                         linea_mercado_ou = None
-                sp_val = odds_list[0].get('spread')
+
+                sp_val = odd0.get('spread')
                 if sp_val is not None:
                     try:
                         spread_mercado = abs(float(sp_val))
                     except (ValueError, TypeError):
                         spread_mercado = None
+
+                # Extraer favorito del mercado desde details (ej. "NY -4.5") o homeTeamOdds/awayTeamOdds
+                details_odds = str(odd0.get('details', '')).strip()
+                home_odds = odd0.get('homeTeamOdds', {})
+                away_odds = odd0.get('awayTeamOdds', {})
+                ml_home = american_odds_a_prob(home_odds.get('moneyLine'))
+                ml_away = american_odds_a_prob(away_odds.get('moneyLine'))
+
+                if ml_home is not None and ml_away is not None and (ml_home + ml_away) > 0:
+                    prob_mercado_t1 = round((ml_home / (ml_home + ml_away)) * 100.0, 1)
 
             bajas_evento_ids = set()
             bajas_evento_nombres = set()
@@ -311,8 +339,28 @@ def obtener_cartelera_por_fecha(fecha_str):
             estado_desc = status_type.get('shortDetail') or status_type.get('description', 'Programado')
 
             if len(competidores) == 2:
-                t1 = competidores[0]
-                t2 = competidores[1]
+                # Asegurar que t1 sea el LOCAL (home) si ESPN lo indica
+                if competidores[0].get('homeAway') == 'away' and competidores[1].get('homeAway') == 'home':
+                    t1, t2 = competidores[1], competidores[0]
+                    if prob_mercado_t1 is not None:
+                        prob_mercado_t1 = round(100.0 - prob_mercado_t1, 1)
+                else:
+                    t1, t2 = competidores[0], competidores[1]
+
+                abrev_1 = t1.get('team', {}).get('abbreviation', '')
+                abrev_2 = t2.get('team', {}).get('abbreviation', '')
+
+                # Inferir spread firmado para t1 (local) si details existe
+                if odds_list and isinstance(odds_list, list):
+                    det_str = str(odds_list[0].get('details', '')).upper()
+                    if spread_mercado is not None and det_str:
+                        if abrev_1.upper() in det_str and "-" in det_str:
+                            spread_t1_firmado = -spread_mercado
+                        elif abrev_2.upper() in det_str and "-" in det_str:
+                            spread_t1_firmado = spread_mercado
+
+                if prob_mercado_t1 is None and spread_t1_firmado is not None:
+                    prob_mercado_t1 = round(norm.cdf((-spread_t1_firmado) / 13.0) * 100.0, 1)
 
                 score_1 = t1.get('score', '0')
                 score_2 = t2.get('score', '0')
@@ -322,22 +370,25 @@ def obtener_cartelera_por_fecha(fecha_str):
                     'dt_orden': dt_orden,
                     'hora_ecuador': hora_ecuador_str,
                     'id_t1': str(t1.get('team', {}).get('id')),
-                    'abrev_t1': t1.get('team', {}).get('abbreviation'),
+                    'abrev_t1': abrev_1,
                     'nombre_t1': t1.get('team', {}).get('displayName'),
+                    't1_es_local': (t1.get('homeAway', 'home') == 'home'),
                     'score_t1': int(score_1) if str(score_1).isdigit() else 0,
 
                     'id_t2': str(t2.get('team', {}).get('id')),
-                    'abrev_t2': t2.get('team', {}).get('abbreviation'),
+                    'abrev_t2': abrev_2,
                     'nombre_t2': t2.get('team', {}).get('displayName'),
                     'score_t2': int(score_2) if str(score_2).isdigit() else 0,
 
-                    'encuentro': f"{t1.get('team', {}).get('abbreviation')} vs {t2.get('team', {}).get('abbreviation')}",
-                    'detalle': f"{t1.get('team', {}).get('displayName')} vs {t2.get('team', {}).get('displayName')}",
+                    'encuentro': f"{abrev_1} vs {abrev_2}",
+                    'detalle': f"{t1.get('team', {}).get('displayName')} (Local) vs {t2.get('team', {}).get('displayName')}",
                     'estado': estado_desc,
                     'estado_codigo': status_type.get('state', 'pre'),
                     'cuarto': int(status_obj.get('period', 0)),
                     'linea_mercado_ou': linea_mercado_ou,
                     'spread_mercado': spread_mercado,
+                    'spread_t1_firmado': spread_t1_firmado,
+                    'prob_mercado_t1': prob_mercado_t1,
                     'bajas_evento_ids': list(bajas_evento_ids),
                     'bajas_evento_nombres': list(bajas_evento_nombres)
                 })
@@ -428,6 +479,7 @@ def obtener_metricas_avanzadas_equipos():
                     'pace': round(pace_est, 2),
                     'off_rtg': round(off_rtg, 2),
                     'def_rtg': round(def_rtg, 2),
+                    'net_rtg': round(off_rtg - def_rtg, 2),
                     'pts_favor': round(pts_favor, 1),
                     'pts_contra': round(pts_contra, 1)
                 }
@@ -437,6 +489,7 @@ def obtener_metricas_avanzadas_equipos():
                     'pace': 99.5,
                     'off_rtg': 114.5,
                     'def_rtg': 114.5,
+                    'net_rtg': 0.0,
                     'pts_favor': 114.0,
                     'pts_contra': 114.0
                 }
@@ -579,7 +632,7 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
         v5 = df_5[col].mean()
         v10 = df_10[col].mean()
         vall = df_v[col].mean()
-        return (0.55 * v5) + (0.30 * v10) + (0.15 * vall)
+        return (0.50 * v5) + (0.35 * v10) + (0.15 * vall)
 
     min_p = pond_col('MIN')
     pts_p = pond_col('PTS')
@@ -587,7 +640,6 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
     ast_p = pond_col('AST')
     pra_p = pond_col('PRA') if 'PRA' in df_v.columns else (pts_p + reb_p + ast_p)
 
-    # Radar de Momentum L3 vs Temporada (PRA)
     pra_season = float((df_v['PTS'] + df_v['REB'] + df_v['AST']).mean())
     pra_l3 = float((df_3['PTS'] + df_3['REB'] + df_3['AST']).mean())
     delta_mom = ((pra_l3 - pra_season) / max(pra_season, 1.0)) * 100.0
@@ -600,15 +652,15 @@ def calcular_estadisticas_ponderadas_jugador(df_jugador_previo):
 
     tasa_pts_5 = df_5['PTS'].sum() / max(df_5['MIN'].sum(), 1.0)
     tasa_pts_10 = df_10['PTS'].sum() / max(df_10['MIN'].sum(), 1.0)
-    tasa_pts = (0.55 * tasa_pts_5) + (0.45 * tasa_pts_10)
+    tasa_pts = (0.50 * tasa_pts_5) + (0.50 * tasa_pts_10)
 
     tasa_reb_5 = df_5['REB'].sum() / max(df_5['MIN'].sum(), 1.0)
     tasa_reb_10 = df_10['REB'].sum() / max(df_10['MIN'].sum(), 1.0)
-    tasa_reb = (0.55 * tasa_reb_5) + (0.45 * tasa_reb_10)
+    tasa_reb = (0.50 * tasa_reb_5) + (0.50 * tasa_reb_10)
 
     tasa_ast_5 = df_5['AST'].sum() / max(df_5['MIN'].sum(), 1.0)
     tasa_ast_10 = df_10['AST'].sum() / max(df_10['MIN'].sum(), 1.0)
-    tasa_ast = (0.55 * tasa_ast_5) + (0.45 * tasa_ast_10)
+    tasa_ast = (0.50 * tasa_ast_5) + (0.50 * tasa_ast_10)
 
     return {
         'min': round(min_p, 1),
@@ -635,11 +687,11 @@ def calcular_lineas_automaticas_jugador(df_jugador_previo):
     st_pond = calcular_estadisticas_ponderadas_jugador(df_jugador_previo)
     df_10 = df_v.head(10)
 
-    pts_ref = (0.65 * st_pond['pts']) + (0.35 * df_10['PTS'].median())
-    reb_ref = (0.65 * st_pond['reb']) + (0.35 * df_10['REB'].median())
-    ast_ref = (0.65 * st_pond['ast']) + (0.35 * df_10['AST'].median())
+    pts_ref = (0.60 * st_pond['pts']) + (0.40 * df_10['PTS'].median())
+    reb_ref = (0.60 * st_pond['reb']) + (0.40 * df_10['REB'].median())
+    ast_ref = (0.60 * st_pond['ast']) + (0.40 * df_10['AST'].median())
     pra_series = df_10['PRA'] if 'PRA' in df_10.columns else (df_10['PTS'] + df_10['REB'] + df_10['AST'])
-    pra_ref = (0.65 * st_pond['pra']) + (0.35 * pra_series.median())
+    pra_ref = (0.60 * st_pond['pra']) + (0.40 * pra_series.median())
 
     def a_medio_punto(val):
         return max(np.floor(val) + 0.5, 0.5)
@@ -771,6 +823,7 @@ def calcular_ajustes_rotacion_capa5(
                     'pos': inf.get('position', 'F'),
                     'grupo_pos': grupo_pos,
                     'min_base': min_base,
+                    'pts_base': st_p['pts'],
                     'usg_est': round(usg_est, 1),
                     'status_raw': status_raw,
                     'es_baja_reciente': es_baja_reciente
@@ -857,13 +910,48 @@ def calcular_ajustes_rotacion_capa5(
     return ajustes, jugadores_out
 
 
+def calcular_penalizacion_colectiva_bajas(bajas_equipo_lista):
+    """
+    Convierte las bajas de estrellas/titulares de un equipo en un ajuste real de OffRtg y DefRtg.
+    Evita que el modelo apueste por equipos diezmados por lesiones.
+    """
+    if not bajas_equipo_lista:
+        return 1.0, 1.0, 0.0
+
+    impacto_acumulado = 0.0
+    for b in bajas_equipo_lista:
+        if not b.get('es_baja_reciente', True):
+            continue
+        pts_b = float(b.get('pts_base', 10.0))
+        usg_b = float(b.get('usg_est', 18.0))
+        if pts_b >= 22.0 or usg_b >= 27.0:
+            impacto_acumulado += 0.032  # Estrella principal (-3.2% eficiencia ofensiva)
+        elif pts_b >= 15.0 or usg_b >= 21.0:
+            impacto_acumulado += 0.018  # Titular clave (-1.8% eficiencia)
+        else:
+            impacto_acumulado += 0.008  # Rotación (-0.8%)
+
+    impacto_tope = min(impacto_acumulado, 0.075)
+    factor_off = round(1.0 - impacto_tope, 4)
+    factor_def = round(1.0 + (impacto_tope * 0.45), 4)  # Empeora ligeramente la defensa
+    return factor_off, factor_def, round(impacto_tope * 100.0, 1)
+
+
 # ==============================================================================
-# 3. CAPAS 1, 2 Y 3 CALIBRADAS: CLASIFICACIÓN POR EDGE NETO Y PRA
+# 3. CAPAS 1, 2 Y 3 CALIBRADAS: HCA + PENALIZACIÓN BAJAS + ANCLAJE BAYESIANO
 # ==============================================================================
 
-def clasificar_oportunidad_partido(abrev_ganador, edge_ml, dir_total, linea_ou, edge_ou, umbral_edge=UMBRAL_EDGE_OPERABLE):
-    ml_valido = edge_ml >= umbral_edge
-    ou_valido = edge_ou >= umbral_edge
+def clasificar_oportunidad_partido(
+    abrev_ganador,
+    edge_ml,
+    dir_total,
+    linea_ou,
+    edge_ou,
+    contradice_mercado=False,
+    umbral_edge=UMBRAL_EDGE_OPERABLE
+):
+    ml_valido = (edge_ml >= umbral_edge) and (not contradice_mercado)
+    ou_valido = (edge_ou >= umbral_edge)
 
     if ml_valido and ou_valido:
         nivel = "💎 DOBLE EDGE (ML + O/U)"
@@ -878,9 +966,9 @@ def clasificar_oportunidad_partido(abrev_ganador, edge_ml, dir_total, linea_ou, 
         mercado_op = f"Solo {abrev_ganador} ML (Evitar O/U)"
         score_orden = edge_ml + 4.0
     else:
-        nivel = "⚖️ Sin Ventaja Clara"
-        mercado_op = "No operar (Edge insuficiente)"
-        score_orden = max(edge_ml, edge_ou)
+        nivel = "⚠️ Trampa Mercado" if contradice_mercado else "⚖️ Sin Ventaja Clara"
+        mercado_op = "Descartado (Choca vs Vegas)" if contradice_mercado else "No operar (Edge insuficiente)"
+        score_orden = max(edge_ml, edge_ou) - (10.0 if contradice_mercado else 0.0)
 
     return {
         'nivel': nivel,
@@ -899,8 +987,12 @@ def calcular_contexto_colectivo_capa1(
     promedios_liga,
     linea_mercado_ou=None,
     spread_mercado=None,
+    prob_mercado_t1=None,
+    t1_es_local=True,
     t1_en_b2b=False,
-    t2_en_b2b=False
+    t2_en_b2b=False,
+    bajas_t1_lista=None,
+    bajas_t2_lista=None
 ):
     default_eq = {'pace': 99.5, 'off_rtg': 114.5, 'def_rtg': 114.5, 'pts_favor': 114.0, 'pts_contra': 114.0}
     eq1 = metricas_equipos.get(str(id_t1), default_eq)
@@ -909,26 +1001,38 @@ def calcular_contexto_colectivo_capa1(
     pace_liga = promedios_liga.get('pace_liga', 99.5)
     def_liga = promedios_liga.get('def_liga', 114.5)
 
+    # Penalización por bajas de estrellas en cada equipo
+    f_off_b1, f_def_b1, pen_b1_pct = calcular_penalizacion_colectiva_bajas(bajas_t1_lista)
+    f_off_b2, f_def_b2, pen_b2_pct = calcular_penalizacion_colectiva_bajas(bajas_t2_lista)
+
     pace_1 = eq1['pace'] * (0.99 if t1_en_b2b else 1.0)
-    off_1 = eq1['off_rtg'] * (0.982 if t1_en_b2b else 1.0)
+    off_1 = eq1['off_rtg'] * (0.982 if t1_en_b2b else 1.0) * f_off_b1
+    def_1 = eq1['def_rtg'] * f_def_b1
 
     pace_2 = eq2['pace'] * (0.99 if t2_en_b2b else 1.0)
-    off_2 = eq2['off_rtg'] * (0.982 if t2_en_b2b else 1.0)
+    off_2 = eq2['off_rtg'] * (0.982 if t2_en_b2b else 1.0) * f_off_b2
+    def_2 = eq2['def_rtg'] * f_def_b2
 
     posesiones_esperadas = (pace_1 * pace_2) / pace_liga
 
-    lambda_t1 = (posesiones_esperadas / 100.0) * off_1 * (eq2['def_rtg'] / def_liga)
-    lambda_t2 = (posesiones_esperadas / 100.0) * off_2 * (eq1['def_rtg'] / def_liga)
+    # Ventaja de Localía (+1.45 pts a favor del local, -1.45 pts al visitante = ~2.9 pts netos)
+    hca_ajuste = (VENTAJA_LOCALIA_PTS / 2.0) if t1_es_local else 0.0
 
-    total_proyectado = lambda_t1 + lambda_t2
+    lambda_t1 = ((posesiones_esperadas / 100.0) * off_1 * (def_2 / def_liga)) + hca_ajuste
+    lambda_t2 = ((posesiones_esperadas / 100.0) * off_2 * (def_1 / def_liga)) - hca_ajuste
+
+    total_modelo_puro = lambda_t1 + lambda_t2
 
     if linea_mercado_ou is not None and linea_mercado_ou > 150.0:
         linea_evaluada = linea_mercado_ou
         origen_linea = "Mercado Oficial"
+        # Anclaje bayesiano 70% modelo / 30% mercado para evitar desviaciones irreales de +15 pts
+        total_proyectado = (0.70 * total_modelo_puro) + (0.30 * linea_mercado_ou)
     else:
         base_bruta = ((eq1['pts_favor'] + eq2['pts_contra']) / 2.0) + ((eq2['pts_favor'] + eq1['pts_contra']) / 2.0)
         linea_evaluada = round(base_bruta) + 0.5
         origen_linea = "Auto-Referencia"
+        total_proyectado = total_modelo_puro
 
     std_diferencia = 13.5
     std_total_partido = 16.0
@@ -947,7 +1051,19 @@ def calcular_contexto_colectivo_capa1(
         riesgo_paliza = "BAJO"
         factor_recorte_paliza = 1.0
 
-    prob_t1 = norm.cdf(diferencia_esperada / std_diferencia) * 100.0
+    prob_t1_puro = norm.cdf(diferencia_esperada / std_diferencia) * 100.0
+    prob_t1_puro = min(max(prob_t1_puro, 5.0), 95.0)
+
+    # Calibración Bayesiana con Moneyline / Spread Oficial (evita errores como CLE visitante 71%)
+    contradice_mercado = False
+    if prob_mercado_t1 is not None:
+        prob_t1 = (0.65 * prob_t1_puro) + (0.35 * prob_mercado_t1)
+        # Detectar trampa: modelo dice >55% a un equipo, pero Vegas lo da como underdog claro (<44%)
+        if (prob_t1_puro > 55.0 and prob_mercado_t1 < 44.0) or (prob_t1_puro < 45.0 and prob_mercado_t1 > 56.0):
+            contradice_mercado = True
+    else:
+        prob_t1 = prob_t1_puro
+
     prob_t1 = min(max(prob_t1, 5.0), 95.0)
     prob_t2 = 100.0 - prob_t1
 
@@ -963,12 +1079,16 @@ def calcular_contexto_colectivo_capa1(
         'origen_linea': origen_linea,
         'prob_t1': round(prob_t1, 1),
         'prob_t2': round(prob_t2, 1),
+        'prob_mercado_t1': prob_mercado_t1,
+        'contradice_mercado': contradice_mercado,
         'prob_over_total': round(prob_over_total, 1),
         'spread_proyectado': round(spread_ref, 1),
         'riesgo_paliza': riesgo_paliza,
         'factor_recorte_paliza': factor_recorte_paliza,
         't1_en_b2b': t1_en_b2b,
         't2_en_b2b': t2_en_b2b,
+        'pen_b1_pct': pen_b1_pct,
+        'pen_b2_pct': pen_b2_pct,
         'eq1_stats': eq1,
         'eq2_stats': eq2
     }
@@ -1046,9 +1166,9 @@ def calcular_proyeccion_jugador_capa2_3(
     lambda_reb_tope = min(lambda_reb_bruto, lambda_reb_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_reb_bruto
     lambda_ast_tope = min(lambda_ast_bruto, lambda_ast_sin_bajas * 1.10) if (factor_usage_bump > 1.0 or minutos_proyectados > min_ref) else lambda_ast_bruto
 
-    lambda_pts = (0.80 * lambda_pts_tope) + (0.20 * linea_pts)
-    lambda_reb = (0.80 * lambda_reb_tope) + (0.20 * linea_reb)
-    lambda_ast = (0.80 * lambda_ast_tope) + (0.20 * linea_ast)
+    lambda_pts = (0.78 * lambda_pts_tope) + (0.22 * linea_pts)
+    lambda_reb = (0.78 * lambda_reb_tope) + (0.22 * linea_reb)
+    lambda_ast = (0.78 * lambda_ast_tope) + (0.22 * linea_ast)
     lambda_pra = lambda_pts + lambda_reb + lambda_ast
 
     std_hist_pts = df_valid['PTS'].std() if len(df_valid) > 1 else 6.0
@@ -1090,8 +1210,12 @@ def calcular_proyeccion_jugador_capa2_3(
         prob_m = max(p_m, p_l)
         edge_m = round(prob_m - BREAK_EVEN_ODDS_110, 1)
         hr_m, cv_m, estab_m = calcular_consistencia_y_estabilidad(df_jugador, m_nom, m_lin, dir_m)
+
+        # Penalización fuerte si Hit Rate L10 < 60% (evita líneas infladas por racha corta)
+        penalizacion_hr = max(60.0 - hr_m, 0.0) * 0.35
         penalizacion_anomalia = max(edge_m - 13.5, 0.0) * 0.35
-        score_calidad = edge_m - penalizacion_anomalia + (hr_m - 50.0) * 0.14 - max(cv_m - 25.0, 0.0) * 0.15
+        score_calidad = edge_m - penalizacion_anomalia - penalizacion_hr + (hr_m - 50.0) * 0.22 - max(cv_m - 24.0, 0.0) * 0.18
+
         mercados_eval.append({
             'mercado': m_nom,
             'direccion': dir_m,
@@ -1381,16 +1505,18 @@ def calcular_ajuste_vivo_capa4(
 
 
 # ==============================================================================
-# 5. COMPONENTES VISUALES, GESTIÓN DE BANKROLL (KELLY) Y 4 TICKETS SIN REPETIR
+# 5. COMPONENTES VISUALES, GESTIÓN DE BANKROLL (KELLY) Y 4 TICKETS BLINDADOS
 # ==============================================================================
 
-def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
+def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2, contradice_mercado=False):
     p1 = min(max(float(prob_t1), 5.0), 95.0)
     p2 = round(100.0 - p1, 1)
     p1 = round(p1, 1)
 
     edge_fav = round(max(p1, p2) - BREAK_EVEN_ODDS_110, 1)
-    if edge_fav >= UMBRAL_EDGE_OPERABLE:
+    if contradice_mercado:
+        badge_ganador = f' <span class="badge-normal-conf">🚨 Trampa vs Vegas (Descartado)</span>'
+    elif edge_fav >= UMBRAL_EDGE_OPERABLE:
         fav = abrev_t1 if p1 >= p2 else abrev_t2
         badge_ganador = f' <span class="badge-high-conf">🏆 VENTAJA ML ({fav} {max(p1, p2):.1f}% | Edge +{edge_fav}%)</span>'
     else:
@@ -1398,14 +1524,14 @@ def renderizar_barra_probabilidad_dual(abrev_t1, prob_t1, abrev_t2, prob_t2):
 
     st.markdown(f"""
         <div style="margin-top: 6px;">
-            <span style="font-weight: 700; font-size: 14px;">Probabilidad de Victoria:</span>
-            <span style="color: #60a5fa; font-weight: 700;">{abrev_t1} ({p1:.1f}%)</span> vs
-            <span style="color: #fb923c; font-weight: 700;">{abrev_t2} ({p2:.1f}%)</span>
+            <span style="font-weight: 700; font-size: 14px;">Probabilidad Calibrada (Local vs Visita):</span>
+            <span style="color: #60a5fa; font-weight: 700;">🏠 {abrev_t1} ({p1:.1f}%)</span> vs
+            <span style="color: #fb923c; font-weight: 700;">✈️ {abrev_t2} ({p2:.1f}%)</span>
             {badge_ganador}
         </div>
         <div class="dual-prob-container">
-            <div class="dual-prob-t1" style="width: {p1}%;">🏀 {abrev_t1} {p1:.1f}%</div>
-            <div class="dual-prob-t2" style="width: {p2}%;">{p2:.1f}% {abrev_t2} 🏀</div>
+            <div class="dual-prob-t1" style="width: {p1}%;">🏠 {abrev_t1} {p1:.1f}%</div>
+            <div class="dual-prob-t2" style="width: {p2}%;">{p2:.1f}% {abrev_t2} ✈️</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -1419,7 +1545,6 @@ def obtener_html_badge_confianza(prob_rec):
 
 @st.cache_resource
 def obtener_almacen_global_tickets():
-    # Persiste en memoria del servidor de Streamlit Cloud entre recargas
     return {}
 
 
@@ -1524,15 +1649,15 @@ def calcular_confiabilidad_ticket(lista_picks):
         base_s = 78.0
         if "Jugador" in tipo_p:
             if any(k in proy_txt for k in ["L10: 80%", "L10: 90%", "L10: 100%"]):
-                base_s = 94.0
+                base_s = 95.0
             elif "L10: 70%" in proy_txt:
-                base_s = 86.0
+                base_s = 88.0
             else:
-                base_s = 74.0
+                base_s = 72.0
             if "Estable" in str(p.get('estabilidad_fija', '')):
                 base_s = min(base_s + 4.0, 98.0)
         elif "ML" in tipo_p:
-            base_s = 85.0
+            base_s = 86.0
         else:
             base_s = 76.0 if "Auto-Referencia" in origen_p else 84.0
         puntajes_estab.append(base_s)
@@ -1540,7 +1665,7 @@ def calcular_confiabilidad_ticket(lista_picks):
 
     encuentros_unicos = len(set(p.get('encuentro', '') for p in lista_picks))
     i_div = 100.0 if encuentros_unicos == n else max(55.0, (encuentros_unicos / n) * 100.0)
-    bonus_estructura = 3.5 if n == 2 else 0.0
+    bonus_estructura = 4.0 if n == 2 else 0.0
 
     score_raw = (0.45 * p_geom) + (0.25 * e_norm) + (0.20 * s_estab) + (0.10 * i_div) + bonus_estructura
     score_final = round(min(score_raw, 99.5), 1)
@@ -1557,11 +1682,11 @@ def calcular_confiabilidad_ticket(lista_picks):
 
 def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
     """
-    Construye 4 tickets con 10 selecciones TOTALMENTE DISTINTAS (sin repetir ni una sola):
-    - Ticket 1: 3 opciones (Triple Élite)
-    - Ticket 2: 3 opciones (Triple Alto Valor)
-    - Ticket 3: 2 opciones (Dúo Blindado — Top 2 más seguras)
-    - Ticket 4: 2 opciones (Dúo Jugadores Consistentes — Top 2 jugadores estables)
+    Construye 4 tickets de ALTA CONVERSIÓN con 9 selecciones TOTALMENTE DISTINTAS:
+    - Ticket 3 (2 Opciones): Dúo Blindado — Top 2 selecciones más seguras de la jornada
+    - Ticket 4 (2 Opciones): Dúo Jugadores Élite — Top 2 jugadores con L10 >= 70%
+    - Ticket 1 (2 Opciones): Dúo de Valor — Siguientes 2 mejores oportunidades sin repetir encuentro
+    - Ticket 2 (3 Opciones): Triple Alto Valor — Siguientes 3 oportunidades únicas del día
     """
     candidatos_pool = []
 
@@ -1577,6 +1702,9 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
                 edge_ml = float(gan_txt.split('Edge ')[1].split('%')[0])
             except Exception:
                 prob_ml, edge_ml = 60.0, 7.5
+            # Bono extra si el favorito juega de local
+            es_local_pick = (abrev_g == enc.split(' vs ')[0])
+            bono_local = 2.0 if es_local_pick else 0.0
             candidatos_pool.append({
                 'id_pick': f"EQ_ML_{enc}_{abrev_g}",
                 'tipo': 'Equipo (ML)',
@@ -1589,7 +1717,7 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
                 'proyeccion_fija': f"Prob. {prob_ml:.1f}%",
                 'prob_fija': prob_ml,
                 'edge_fijo': edge_ml,
-                'score_ranking': prob_ml + (edge_ml * 0.45),
+                'score_ranking': prob_ml + (edge_ml * 0.45) + bono_local,
                 'clave_equipo': enc,
                 'clave_jugador': None,
                 'id_jugador': None,
@@ -1597,7 +1725,7 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
                 'abrev_ganador': abrev_g
             })
 
-        if eq.get('_ou_valido'):
+        if eq.get('_ou_valido') and "Mercado Oficial" in origen_l:
             pred_txt = eq.get('Predicción Total', '')
             dir_ou = pred_txt.split(' ')[0]
             linea_ou_str = origen_l.split(' ')[0]
@@ -1620,7 +1748,7 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
                 'proyeccion_fija': f"Proy. {pts_proy} pts",
                 'prob_fija': prob_ou,
                 'edge_fijo': edge_ou,
-                'score_ranking': prob_ou + (edge_ou * 0.45),
+                'score_ranking': prob_ou + (edge_ou * 0.40),
                 'clave_equipo': enc,
                 'clave_jugador': None,
                 'id_jugador': None,
@@ -1631,7 +1759,8 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
         edge_j = float(jug.get('_edge_num', 0.0))
         hr_j = float(jug.get('_hr_num', 0.0))
         estab_j = str(jug.get('_estab_txt', ''))
-        if edge_j < 3.5 or hr_j < 50.0 or "Volátil" in estab_j:
+        # Filtro estricto de consistencia: exige L10 >= 70% y Edge >= 4.5%
+        if edge_j < 4.5 or hr_j < 70.0 or "Volátil" in estab_j:
             continue
 
         try:
@@ -1639,7 +1768,8 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
         except Exception:
             prob_j = 58.0
 
-        bonus_estab = 3.5 if "Estable" in estab_j else 0.5
+        bonus_estab = 4.0 if "Estable" in estab_j else 1.0
+        bonus_hr = (hr_j - 70.0) * 0.25
         candidatos_pool.append({
             'id_pick': f"JUG_{jug.get('Jugador')}_{jug.get('Mercado')}",
             'tipo': f"Jugador ({jug.get('Mercado')})",
@@ -1652,13 +1782,48 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
             'proyeccion_fija': f"Λ {jug.get('Λ Proy.')} (L10: {jug.get('Hit Rate L10')})",
             'prob_fija': prob_j,
             'edge_fijo': edge_j,
-            'score_ranking': prob_j + (edge_j * 0.40) + bonus_estab,
+            'score_ranking': prob_j + (edge_j * 0.40) + bonus_estab + bonus_hr,
             'clave_equipo': jug.get('Encuentro', ''),
             'clave_jugador': jug.get('Jugador', ''),
             'id_jugador': jug.get('_id_jugador', ''),
             'mercado_jug': jug.get('Mercado', 'PTS'),
             'direccion': str(jug.get('Recomendación', '')).split(' ')[0]
         })
+
+    # Respaldo controlado si una jornada tiene pocos partidos y faltan jugadores L10 >= 70%
+    if sum(1 for c in candidatos_pool if "Jugador" in c['tipo']) < 2:
+        ids_ya = {c['id_pick'] for c in candidatos_pool}
+        for jug in resumen_jugadores:
+            id_p = f"JUG_{jug.get('Jugador')}_{jug.get('Mercado')}"
+            if id_p in ids_ya:
+                continue
+            edge_j = float(jug.get('_edge_num', 0.0))
+            hr_j = float(jug.get('_hr_num', 0.0))
+            estab_j = str(jug.get('_estab_txt', ''))
+            if edge_j >= 4.0 and hr_j >= 60.0 and "Volátil" not in estab_j:
+                try:
+                    prob_j = float(str(jug.get('Prob.', '58%')).replace('%', ''))
+                except Exception:
+                    prob_j = 58.0
+                candidatos_pool.append({
+                    'id_pick': id_p,
+                    'tipo': f"Jugador ({jug.get('Mercado')})",
+                    'encuentro': jug.get('Encuentro', ''),
+                    'hora': '-',
+                    'seleccion': f"{jug.get('Jugador')} — {jug.get('Recomendación')}",
+                    'linea_ref': float(jug.get('Línea', 0.0)),
+                    'origen_linea': "Auto-Calculada",
+                    'estabilidad_fija': estab_j,
+                    'proyeccion_fija': f"Λ {jug.get('Λ Proy.')} (L10: {jug.get('Hit Rate L10')})",
+                    'prob_fija': prob_j,
+                    'edge_fijo': edge_j,
+                    'score_ranking': prob_j + (edge_j * 0.35),
+                    'clave_equipo': jug.get('Encuentro', ''),
+                    'clave_jugador': jug.get('Jugador', ''),
+                    'id_jugador': jug.get('_id_jugador', ''),
+                    'mercado_jug': jug.get('Mercado', 'PTS'),
+                    'direccion': str(jug.get('Recomendación', '')).split(' ')[0]
+                })
 
     candidatos_pool.sort(key=lambda x: x['score_ranking'], reverse=True)
 
@@ -1693,11 +1858,11 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
 
     usados_global = set()
 
-    # 1. TICKET 3 (2 Opciones): Dúo Blindado — Top 2 selecciones más seguras de toda la jornada
+    # 1. TICKET 3 (2 Opciones): Dúo Blindado — Top 2 selecciones más seguras de la jornada
     ticket_3 = seleccionar_picks(candidatos_pool, tamano=2, excluir_ids=usados_global)
     usados_global.update(p['id_pick'] for p in ticket_3)
 
-    # 2. TICKET 4 (2 Opciones): Dúo Jugadores Consistentes — Top 2 jugadores estables (sin repetir)
+    # 2. TICKET 4 (2 Opciones): Dúo Jugadores Consistentes — Top 2 jugadores con L10 >= 70%
     ticket_4 = seleccionar_picks(
         candidatos_pool,
         tamano=2,
@@ -1713,11 +1878,11 @@ def construir_tickets_congelados_dia(resumen_equipos, resumen_jugadores):
         ticket_4.extend(faltantes_t4)
     usados_global.update(p['id_pick'] for p in ticket_4)
 
-    # 3. TICKET 1 (3 Opciones): Triple Élite — Siguientes 3 mejores oportunidades distintas
-    ticket_1 = seleccionar_picks(candidatos_pool, tamano=3, excluir_ids=usados_global)
+    # 3. TICKET 1 (2 Opciones): Dúo Élite de Valor — Siguientes 2 oportunidades más sólidas (alta conversión)
+    ticket_1 = seleccionar_picks(candidatos_pool, tamano=2, excluir_ids=usados_global)
     usados_global.update(p['id_pick'] for p in ticket_1)
 
-    # 4. TICKET 2 (3 Opciones): Triple Alto Valor — Siguientes 3 oportunidades distintas
+    # 4. TICKET 2 (3 Opciones): Triple Alto Valor — Siguientes 3 oportunidades únicas del día
     ticket_2 = seleccionar_picks(candidatos_pool, tamano=3, excluir_ids=usados_global)
     usados_global.update(p['id_pick'] for p in ticket_2)
 
@@ -1857,7 +2022,7 @@ def evaluar_estado_actual_pick_congelado(
 # ==============================================================================
 
 st.title("🏀 NBA Real-Time Analytics & Backtesting Engine")
-st.markdown("Motor Probabilístico Institucional + **Radar de Momentum L3** + **Gestor de Bankroll (Kelly)**.")
+st.markdown("Motor Calibrado con **Ventaja de Localía (HCA)** + **Anclaje Bayesiano Vegas** + **Penalización Colectiva por Bajas**.")
 
 st.sidebar.header("⚙️ Configuración y Auditoría")
 
@@ -2002,7 +2167,7 @@ modo_mercado_resumen = st.sidebar.radio(
     index=0
 )
 min_edge_filtro = st.sidebar.slider("Edge Mínimo vs Break-Even (%)", min_value=0.0, max_value=15.0, value=5.0, step=0.5)
-min_hit_rate_filtro = st.sidebar.slider("Consistencia Mínima L10 (%)", min_value=0, max_value=90, value=60, step=10)
+min_hit_rate_filtro = st.sidebar.slider("Consistencia Mínima L10 (%)", min_value=0, max_value=90, value=70, step=10)
 excluir_volatiles = st.sidebar.checkbox("Excluir jugadores 🔴 Volátiles (CV > 33%)", value=True)
 aplicar_filtros_calidad = st.sidebar.checkbox("Activar Filtros de Calidad en Tabla Jugadores", value=True)
 
@@ -2034,7 +2199,7 @@ tab_modelo, tab_buscador = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: MOTOR PROBABILÍSTICO, CARTELERA, TABLAS Y 4 TICKETS SIN REPETIR
+# PESTAÑA 1: MOTOR PROBABILÍSTICO, CARTELERA, TABLAS Y 4 TICKETS BLINDADOS
 # ------------------------------------------------------------------------------
 with tab_modelo:
     @st.fragment(run_every=30 if modo_vivo else None)
@@ -2165,17 +2330,7 @@ with tab_modelo:
                     t1_b2b = (str(t1_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
                     t2_b2b = (str(t2_id) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
 
-                    ctx_partido = calcular_contexto_colectivo_capa1(
-                        t1_id, t2_id, metricas_equipos, promedios_liga,
-                        linea_mercado_ou=partido.get('linea_mercado_ou'),
-                        spread_mercado=partido.get('spread_mercado'),
-                        t1_en_b2b=t1_b2b,
-                        t2_en_b2b=t2_b2b
-                    )
-                    linea_ou_partido = ctx_partido['linea_evaluada']
-                    origen_ou_partido = ctx_partido['origen_linea']
-                    factor_paliza_partido = ctx_partido['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
-
+                    # Calcular bajas primero para alimentar la penalización colectiva de Capa 1
                     ajustes_t1, bajas_t1 = obtener_ajustes_equipo_cached(
                         t1_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
                     )
@@ -2183,14 +2338,33 @@ with tab_modelo:
                         t2_id, partido.get('bajas_evento_ids'), partido.get('bajas_evento_nombres'), datos_vivo_p
                     )
 
-                    badges_ctx = []
+                    ctx_partido = calcular_contexto_colectivo_capa1(
+                        t1_id, t2_id, metricas_equipos, promedios_liga,
+                        linea_mercado_ou=partido.get('linea_mercado_ou'),
+                        spread_mercado=partido.get('spread_mercado'),
+                        prob_mercado_t1=partido.get('prob_mercado_t1'),
+                        t1_es_local=partido.get('t1_es_local', True),
+                        t1_en_b2b=t1_b2b,
+                        t2_en_b2b=t2_b2b,
+                        bajas_t1_lista=bajas_t1,
+                        bajas_t2_lista=bajas_t2
+                    )
+                    linea_ou_partido = ctx_partido['linea_evaluada']
+                    origen_ou_partido = ctx_partido['origen_linea']
+                    factor_paliza_partido = ctx_partido['factor_recorte_paliza'] if aplicar_b2b_y_paliza else 1.0
+
+                    badges_ctx = ["🏠 Localía +2.9 pts"]
                     if t1_b2b:
                         badges_ctx.append(f"🔋 {partido['abrev_t1']} en B2B")
                     if t2_b2b:
                         badges_ctx.append(f"🔋 {partido['abrev_t2']} en B2B")
+                    if ctx_partido['pen_b1_pct'] > 0:
+                        badges_ctx.append(f"🏥 {partido['abrev_t1']} -{ctx_partido['pen_b1_pct']}% OffRtg")
+                    if ctx_partido['pen_b2_pct'] > 0:
+                        badges_ctx.append(f"🏥 {partido['abrev_t2']} -{ctx_partido['pen_b2_pct']}% OffRtg")
                     if ctx_partido['riesgo_paliza'] != "BAJO" and aplicar_b2b_y_paliza:
-                        badges_ctx.append(f"🚨 Riesgo Paliza {ctx_partido['riesgo_paliza']} (Spread ~{ctx_partido['spread_proyectado']} pts)")
-                    str_badges = f" | {' · '.join(badges_ctx)}" if badges_ctx else ""
+                        badges_ctx.append(f"🚨 Riesgo Paliza {ctx_partido['riesgo_paliza']}")
+                    str_badges = f" | {' · '.join(badges_ctx)}"
 
                     if partido_en_vivo:
                         marcador_str = f" 🔴 EN VIVO ({partido['estado']}): **{partido['abrev_t1']} {partido['score_t1']} - {partido['score_t2']} {partido['abrev_t2']}**"
@@ -2202,15 +2376,15 @@ with tab_modelo:
                     st.markdown(f"### ⏰ [{partido['hora_ecuador']} ECT] 🏟️ {partido['encuentro']} — *{partido['detalle']}*{marcador_str}")
                     st.caption(
                         f"⚡ **Ritmo Esperado:** {ctx_partido['posesiones_esperadas']} pos | "
-                        f"**{partido['abrev_t1']}:** Λ = {ctx_partido['lambda_t1']} pts | "
-                        f"**{partido['abrev_t2']}:** Λ = {ctx_partido['lambda_t2']} pts{str_badges}"
+                        f"**🏠 {partido['abrev_t1']}:** Λ = {ctx_partido['lambda_t1']} pts | "
+                        f"**✈️ {partido['abrev_t2']}:** Λ = {ctx_partido['lambda_t2']} pts{str_badges}"
                     )
 
                     if bajas_t1 or bajas_t2:
                         txt_b1 = f"**{partido['abrev_t1']} OUT:** {', '.join([b['nombre'] for b in bajas_t1])}" if bajas_t1 else ""
                         txt_b2 = f"**{partido['abrev_t2']} OUT:** {', '.join([b['nombre'] for b in bajas_t2])}" if bajas_t2 else ""
                         separador = " | " if (txt_b1 and txt_b2) else ""
-                        st.warning(f"🏥 **Bajas excluidas automáticamente (Capa 5 activa):** {txt_b1}{separador}{txt_b2}")
+                        st.warning(f"🏥 **Bajas aplicadas en Equipo y Jugadores (Capa 1 + Capa 5):** {txt_b1}{separador}{txt_b2}")
 
                     jugadores_t1 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t1_id]
                     jugadores_t2 = [(nom, inf) for nom, inf in catalogo_jugadores.items() if str(inf.get('team_id')) == t2_id]
@@ -2263,7 +2437,7 @@ with tab_modelo:
                             cv_m = m_sel['cv']
                             estab_m = m_sel['estabilidad']
 
-                            es_alta_conf = (prob_m >= UMBRAL_ALTA_CONFIANZA and edge_m >= 5.0 and hr_m >= 60.0 and "Volátil" not in estab_m)
+                            es_alta_conf = (prob_m >= UMBRAL_ALTA_CONFIANZA and edge_m >= 5.0 and hr_m >= 70.0 and "Volátil" not in estab_m)
 
                             real_str = "-"
                             desglose_str = "-"
@@ -2358,7 +2532,7 @@ with tab_modelo:
                             mm1 = proy_1['mejor_mercado']
                             etiqueta_extra_1 = f" | {', '.join(notas_min_1)}" if notas_min_1 else ""
                             sello_exp_1 = f" 🔥 {mm1['direccion']} {mm1['linea']} {mm1['mercado']} (Edge {mm1['edge']:+.1f}%)" if mm1['edge'] >= 4.5 else ""
-                            with st.expander(f"⭐ {partido['abrev_t1']} - {nom_1} (PTS Λ: {proy_1['lambda_pts']:.1f} vs {lineas_auto_1['pts']}{etiqueta_extra_1}){sello_exp_1}"):
+                            with st.expander(f"⭐ 🏠 {partido['abrev_t1']} - {nom_1} (PTS Λ: {proy_1['lambda_pts']:.1f} vs {lineas_auto_1['pts']}{etiqueta_extra_1}){sello_exp_1}"):
                                 st.markdown(obtener_html_badge_confianza(mm1['prob']), unsafe_allow_html=True)
                                 st.markdown(
                                     f"**Mejor Mercado:** `{mm1['direccion']} {mm1['linea']} {mm1['mercado']}` (Λ: {mm1['lambda']}) | "
@@ -2394,7 +2568,7 @@ with tab_modelo:
                             mm2 = proy_2['mejor_mercado']
                             etiqueta_extra_2 = f" | {', '.join(notas_min_2)}" if notas_min_2 else ""
                             sello_exp_2 = f" 🔥 {mm2['direccion']} {mm2['linea']} {mm2['mercado']} (Edge {mm2['edge']:+.1f}%)" if mm2['edge'] >= 4.5 else ""
-                            with st.expander(f"⭐ {partido['abrev_t2']} - {nom_2} (PTS Λ: {proy_2['lambda_pts']:.1f} vs {lineas_auto_2['pts']}{etiqueta_extra_2}){sello_exp_2}"):
+                            with st.expander(f"⭐ ✈️ {partido['abrev_t2']} - {nom_2} (PTS Λ: {proy_2['lambda_pts']:.1f} vs {lineas_auto_2['pts']}{etiqueta_extra_2}){sello_exp_2}"):
                                 st.markdown(obtener_html_badge_confianza(mm2['prob']), unsafe_allow_html=True)
                                 st.markdown(
                                     f"**Mejor Mercado:** `{mm2['direccion']} {mm2['linea']} {mm2['mercado']}` (Λ: {mm2['lambda']}) | "
@@ -2427,13 +2601,14 @@ with tab_modelo:
                         dir_total=verdict_partido_total,
                         linea_ou=linea_ou_partido,
                         edge_ou=edge_ou,
+                        contradice_mercado=ctx_partido['contradice_mercado'],
                         umbral_edge=UMBRAL_EDGE_OPERABLE
                     )
 
                     ganador_display = (
                         f"{ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}%)"
                         if clasif_eq['ml_valido']
-                        else f"⚠️ {ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}% - Sin Edge)"
+                        else f"⚠️ {ganador_recomendado} ({max_prob_val:.1f}% | Edge {edge_ml:+.1f}% - Descartado)"
                     )
                     total_display = (
                         f"{verdict_partido_total} ({prob_total_rec:.1f}% | Edge {edge_ou:+.1f}%)"
@@ -2508,7 +2683,7 @@ with tab_modelo:
                             if clasif_eq['ml_valido']:
                                 st.success(f"🏆 **Ganador Operable:** **{ganador_display}** | Vivo: **{estado_ganador_vivo}**")
                             else:
-                                st.info(f"⚖️ **Ganador Sin Edge:** {ganador_display} | Vivo: **{estado_ganador_vivo}**")
+                                st.info(f"⚖️ **Ganador Descartado:** {ganador_display} | Vivo: **{estado_ganador_vivo}**")
                         with col_r2:
                             if clasif_eq['ou_valido']:
                                 st.warning(f"📈 **Total Operable ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → **{total_display}** | Acumulado: **{total_actual} pts**")
@@ -2547,16 +2722,19 @@ with tab_modelo:
                             else:
                                 st.info(f"⚖️ **Total Descartado ({linea_ou_partido}):** Proy. {total_proyectado_partido:.1f} → {total_display}")
 
-                    renderizar_barra_probabilidad_dual(partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2)
+                    renderizar_barra_probabilidad_dual(
+                        partido['abrev_t1'], prob_t1, partido['abrev_t2'], prob_t2,
+                        contradice_mercado=ctx_partido['contradice_mercado']
+                    )
                     st.markdown("---")
         else:
             st.info(f"No hay partidos registrados en la cartelera oficial para la fecha: {fecha_seleccionada}.")
 
         # --- RESUMEN EJECUTIVO DE EQUIPOS ---
         if resumen_equipos:
-            st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Clasificados por Edge Real)")
+            st.subheader("📋 Resumen Ejecutivo: Pronósticos de Equipos (Calibrados con Localía y Vegas)")
             st.markdown(
-                f"Separa automáticamente **💎 Doble Edge**, **🎯 Edge Solo Total (O/U)** y **🏆 Edge Solo Ganador (ML)** "
+                f"Filtra automáticamente trampas de visitantes y separa **💎 Doble Edge**, **🎯 Edge Solo Total (O/U)** y **🏆 Edge Solo Ganador (ML)** "
                 f"(umbral mínimo **Edge ≥ +{UMBRAL_EDGE_OPERABLE:.1f}%**)."
             )
 
@@ -2624,72 +2802,21 @@ with tab_modelo:
             st.markdown("---")
 
         # ======================================================================
-        # SIMULACIÓN DE 4 TICKETS BLINDADOS (10 OPCIONES ÚNICAS + KELLY BANKROLL)
+        # SIMULACIÓN DE 4 TICKETS DE ALTA CONVERSIÓN (3 DÚOS + 1 TRIPLE)
         # ======================================================================
         if resumen_equipos or resumen_jugadores:
-            st.subheader(f"🎟️ Simulación de 4 Tickets Blindados (10 Picks Únicos + Kelly Bankroll) — Fecha: {fecha_seleccionada}")
+            st.subheader(f"🎟️ Simulación de 4 Tickets de Alta Conversión (9 Picks Únicos + Kelly) — Fecha: {fecha_seleccionada}")
             st.markdown(
-                f"Los 4 tickets contienen **10 selecciones totalmente distintas entre sí** (nunca repiten opciones) con gestión de capital **Kelly Fraccionado (0.25x)** sobre tu bankroll de **${bankroll_usuario:,.2f} USD**. "
-                "Si **1 sola opción falla**, toda la tarjeta cambia automáticamente a **rojo**."
+                f"Los 4 tickets contienen **9 selecciones totalmente distintas entre sí** (3 Dúos de máxima tasa de acierto + 1 Triple de alto valor) con gestión **Kelly (0.25x)** sobre **${bankroll_usuario:,.2f} USD**."
             )
 
-            with st.expander("📘 Guía Rápida: ¿Cómo leer los 4 Tickets, Criterio de Kelly y el Ticket de Ejemplo?"):
+            with st.expander("📘 Guía Rápida: ¿Por qué 3 Dúos + 1 Triple aumentan drásticamente los aciertos?"):
                 st.markdown("""
-                **1. Estructura de los 4 Tickets (10 selecciones distintas sin repetir):**
-                * **Ticket 3 y Ticket 4 (2 opciones):** Combinadas cortas (*Dúos Blindados*) con las **2 selecciones de mayor probabilidad** y los **2 jugadores más consistentes**; al tener solo 2 patas, maximizan el **Índice de Confiabilidad**.
-                * **Ticket 1 y Ticket 2 (3 opciones):** Combinadas triples con las siguientes mejores oportunidades independientes del día.
-
-                **2. Gestión de Bankroll (Kelly 0.25x):**
-                * Calcula automáticamente el **Stake Sugerido ($)** proporcional al *Edge* y la probabilidad real de cada ticket para proteger tu capital frente a la varianza.
-
-                **3. Regla de Color Dinámico:**
-                * Si falla cualquier selección, la tarjeta completa cambia automáticamente a **Rojo (`❌ TICKET FALLADO`)**.
+                * **Ticket 3 — Dúo Blindado (2 Opciones):** Las 2 selecciones más seguras de toda la jornada (priorizando favoritos locales calibrados con Vegas).
+                * **Ticket 4 — Dúo Jugadores Consistentes (2 Opciones):** Exige **Hit Rate L10 ≥ 70%** (mínimo 7 de 10 partidos cumplidos) y baja volatilidad.
+                * **Ticket 1 — Dúo Élite de Valor (2 Opciones):** Siguientes 2 mejores oportunidades independientes del día.
+                * **Ticket 2 — Triple Alto Valor (3 Opciones):** Combinada de 3 patas independientes para multiplicar retorno.
                 """)
-
-                st.markdown("""
-                    <div style="background-color: rgba(16, 185, 129, 0.18); border: 2px solid #10b981; border-radius: 10px; padding: 14px; margin-bottom: 10px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-                            <div>
-                                <h4 style="margin: 0; color: #ffffff;">📘 TICKET DE EJEMPLO (Dúo Blindado de 2 Opciones)</h4>
-                                <span style="font-size: 13px; color: #cbd5e1;">
-                                    Confiabilidad: <b style="color: #34d399;">91.2 / 100 pts</b> • Prob. Combinada: <b>58.4%</b> • Stake Kelly: <b>$4.50</b> (Retorno Est.: <b>$11.90</b>)
-                                </span>
-                            </div>
-                            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                                <span style="font-weight: 800; font-size: 12px; padding: 5px 11px; border-radius: 999px; background-color: #10b981; color: #052e16;">
-                                    🛡️ GRADO A+ (Blindado)
-                                </span>
-                                <span style="font-weight: 800; font-size: 12px; padding: 5px 11px; border-radius: 999px; background-color: rgba(15, 23, 42, 0.85); color: #ffffff; border: 1px solid #10b981;">
-                                    🏆 TICKET GANADO (2/2 ACERTADAS)
-                                </span>
-                            </div>
-                        </div>
-                    </div>
-                """, unsafe_allow_html=True)
-
-                df_ejemplo_tk = pd.DataFrame([
-                    {
-                        'Tipo': 'Equipo (ML)',
-                        'Encuentro': 'MEM vs CHA',
-                        'Selección Congelada': 'MEM Ganador (ML)',
-                        'Proyección Fija': 'Prob. 84.0%',
-                        'Prob. Fija': '84.0%',
-                        'Edge Fijo': '+31.6%',
-                        'Resultado Real / Vivo': '🏁 CHA 111-117 MEM',
-                        'Estado': '🟢 Acierto'
-                    },
-                    {
-                        'Tipo': 'Jugador (PRA)',
-                        'Encuentro': 'BOS vs MIA',
-                        'Selección Congelada': 'Jayson Tatum — MÁS 39.5 PRA',
-                        'Proyección Fija': 'Λ 43.2 (L10: 80%)',
-                        'Prob. Fija': '69.5%',
-                        'Edge Fijo': '+17.1%',
-                        'Resultado Real / Vivo': '44 PRA (29P / 9R / 6A)',
-                        'Estado': '🟢 Acierto'
-                    }
-                ])
-                st.dataframe(df_ejemplo_tk, use_container_width=True, hide_index=True, key="df_ticket_ejemplo_guia")
 
             tickets_dia = cargar_tickets_fecha_persistente(fecha_busqueda_str)
 
@@ -2698,7 +2825,6 @@ with tab_modelo:
                 guardar_tickets_fecha_persistente(fecha_busqueda_str, nuevos_tk, modo_guardado="Fijado inicial")
                 tickets_dia = nuevos_tk
 
-            # --- BOTONES SEPARADOS: 1. FIJAR TICKETS ACTUALES | 2. REGENERAR CON ALINEACIONES ---
             col_tk_btn1, col_tk_btn2, col_tk_info = st.columns([1.2, 1.5, 2.3])
             with col_tk_btn1:
                 if st.button("🔒 Fijar Tickets Actuales", key=f"btn_fijar_tk_{fecha_busqueda_str}", use_container_width=True, type="primary"):
@@ -2810,8 +2936,8 @@ with tab_modelo:
             col_tk1, col_tk2 = st.columns(2)
             with col_tk1:
                 renderizar_tarjeta_ticket(
-                    "🎟️ TICKET 1 — Triple Élite (3 Opciones)",
-                    "3 selecciones independientes de alta ventaja",
+                    "🎟️ TICKET 1 — Dúo Élite de Valor (2 Opciones)",
+                    "2 selecciones independientes de alta ventaja calibradas",
                     tickets_dia.get('ticket_1', []),
                     f"df_tk1_{fecha_busqueda_str}_{ciclo_key}"
                 )
@@ -2834,7 +2960,7 @@ with tab_modelo:
             with col_tk4:
                 renderizar_tarjeta_ticket(
                     "🎟️ TICKET 4 — Dúo Jugadores Consistentes (2 Opciones)",
-                    "Top 2 jugadores con mayor estabilidad L10 y Edge (sin repetir)",
+                    "Top 2 jugadores con L10 ≥ 70% y estabilidad comprobada (sin repetir)",
                     tickets_dia.get('ticket_4', []),
                     f"df_tk4_{fecha_busqueda_str}_{ciclo_key}"
                 )
@@ -2910,6 +3036,9 @@ with tab_modelo:
                     t1_b2b_ev = (str(evento_jugador["id_t1"]) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
                     t2_b2b_ev = (str(evento_jugador["id_t2"]) in equipos_b2b_hoy) if aplicar_b2b_y_paliza else False
 
+                    _, b_ev1 = obtener_ajustes_equipo_cached(str(evento_jugador["id_t1"]))
+                    _, b_ev2 = obtener_ajustes_equipo_cached(str(evento_jugador["id_t2"]))
+
                     ctx_j = calcular_contexto_colectivo_capa1(
                         str(evento_jugador["id_t1"]),
                         str(evento_jugador["id_t2"]),
@@ -2917,8 +3046,12 @@ with tab_modelo:
                         promedios_liga,
                         linea_mercado_ou=evento_jugador.get('linea_mercado_ou'),
                         spread_mercado=evento_jugador.get('spread_mercado'),
+                        prob_mercado_t1=evento_jugador.get('prob_mercado_t1'),
+                        t1_es_local=evento_jugador.get('t1_es_local', True),
                         t1_en_b2b=t1_b2b_ev,
-                        t2_en_b2b=t2_b2b_ev
+                        t2_en_b2b=t2_b2b_ev,
+                        bajas_t1_lista=b_ev1,
+                        bajas_t2_lista=b_ev2
                     )
                     posesiones_ctx = ctx_j['posesiones_esperadas']
                     def_rtg_rival_ctx = metricas_equipos.get(id_rival, {}).get('def_rtg', promedios_liga['def_liga'])
